@@ -25,7 +25,11 @@ jobs:
           echo ::set-output name=tag::${GITHUB_REF/refs\/tags\//}
       - name: Build and push to GitHub Packages
         run: |
-          echo "${IMG}:${TAG}"
+          echo "Build ${REPO}:${TAG}..."
+          IMG="${REPO}/${TAG}" make operator-image \
+            && docker tag "${REPO}/${TAG}" "${REPO}/latest" \
+            && docker push "${REPO}/${TAG}" \
+            && docker push "${REPO}/latest"
         env:
-          IMG: elanv/flink-operator
+          REPO: ${{ github.repository }}
           TAG: ${{ steps.dockerTag.outputs.tag }}
