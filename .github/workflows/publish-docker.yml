@@ -26,9 +26,7 @@ jobs:
           images: ghcr.io/${{ github.repository }}
       - name: Build and push to GitHub Packages
         run: |
-          make operator-image \
-            && docker tag ${{ steps.meta.outputs.tags[0] }} ${{ steps.meta.outputs.tags[1] }} \
-            && docker push ${{ steps.meta.outputs.tags[0] }} \
-            && docker push ${{ steps.meta.outputs.tags[1] }}
+          echo ${{ steps.meta.outputs.tags[0] }} ${{ steps.meta.outputs.tags[1] }}
+          echo ${IMG}
         env:
           IMG: ${{ steps.meta.outputs.tags[0] }}
