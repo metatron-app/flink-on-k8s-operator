@@ -25,9 +25,10 @@ jobs:
         with:
           images: ghcr.io/${{ github.repository }}
       - name: Build and push to GitHub Packages
-        uses: docker/build-push-action@v2
-        with:
-          push: true
-          context: .
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
+        run: |
+          make operator-image \
+            && docker tag ${{ steps.meta.outputs.tags[0] }} ${{ steps.meta.outputs.tags[1] }} \
+            && docker push ${{ steps.meta.outputs.tags[0] }} \
+            && docker push ${{ steps.meta.outputs.tags[1] }}
+        env:
+          IMG: ${{ steps.meta.outputs.tags[0] }}
