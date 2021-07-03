@@ -26,10 +26,10 @@ jobs:
       - name: Build and push to GitHub Packages
         run: |
           echo "Build ${REPO}:${TAG}..."
-          IMG="${REPO}/${TAG}" make operator-image \
-            && docker tag "${REPO}/${TAG}" "${REPO}/latest" \
-            && docker push "${REPO}/${TAG}" \
-            && docker push "${REPO}/latest"
+          IMG="${REPO}:${TAG}" make operator-image \
+            && docker tag "${REPO}:${TAG}" "${REPO}:latest" \
+            && docker push "${REPO}:${TAG}" \
+            && docker push "${REPO}:latest"
         env:
-          REPO: ${{ github.repository }}
+          REPO: ghcr.io/${{ github.repository }}
           TAG: ${{ steps.dockerTag.outputs.tag }}
