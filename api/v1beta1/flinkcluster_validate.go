@@ -20,9 +20,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"reflect"
-	"strconv"
 	"strings"
-	"time"
 
 	"k8s.io/apimachinery/pkg/api/resource"
 
@@ -84,11 +82,6 @@ func (v *Validator) ValidateUpdate(old *FlinkCluster, new *FlinkCluster) error {
 		return err
 	}
 
-	// Skip remaining validation if no changes in spec.
-	if reflect.DeepEqual(new.Spec, old.Spec) {
-		return nil
-	}
-
 	cancelRequested, err := v.checkCancelRequested(old, new)
 	if err != nil {
 		return err
@@ -122,24 +115,24 @@ func (v *Validator) checkControlAnnotations(old *FlinkCluster, new *FlinkCluster
 	oldUserControl, _ := old.Annotations[ControlAnnotation]
 	newUserControl, ok := new.Annotations[ControlAnnotation]
 	if ok {
-		if oldUserControl != newUserControl && old.Status.Control != nil && old.Status.Control.State == ControlStateInProgress {
+		if oldUserControl != newUserControl && old.Status.Control != nil && old.Status.Control.State == ControlStateProgressing {
 			return fmt.Errorf(ControlChangeWarnMsg, ControlAnnotation)
 		}
 		switch newUserControl {
 		case ControlNameJobCancel:
-			var job = old.Status.Components.Job
+			var jobStatus = old.Status.Components.Job
 			if old.Spec.Job == nil {
 				return fmt.Errorf(SessionClusterWarnMsg, ControlNameJobCancel, ControlAnnotation)
-			} else if job == nil || job.IsTerminated(old.Spec.Job) {
+			} else if jobStatus == nil || isJobTerminated(old.Spec.Job.RestartPolicy, jobStatus) {
 				return fmt.Errorf(InvalidJobStateForJobCancelMsg, ControlAnnotation)
 			}
 		case ControlNameSavepoint:
-			var job = old.Status.Components.Job
+			var jobStatus = old.Status.Components.Job
 			if old.Spec.Job == nil {
 				return fmt.Errorf(SessionClusterWarnMsg, ControlNameSavepoint, ControlAnnotation)
 			} else if old.Spec.Job.SavepointsDir == nil || *old.Spec.Job.SavepointsDir == "" {
 				return fmt.Errorf(InvalidSavepointDirMsg, ControlAnnotation)
-			} else if job == nil || job.IsStopped() {
+			} else if jobStatus == nil || isJobStopped(old.Status.Components.Job) {
 				return fmt.Errorf(InvalidJobStateForSavepointMsg, ControlAnnotation)
 			}
 		default:
@@ -218,39 +211,14 @@ func (v *Validator) validateJobUpdate(old *FlinkCluster, new *FlinkCluster) erro
 	case old.Spec.Job == nil && new.Spec.Job == nil:
 		return nil
 	case old.Spec.Job == nil || new.Spec.Job == nil:
-		oldJobSpec, _ := json.Marshal(old.Spec.Job)
-		newJobSpec, _ := json.Marshal(new.Spec.Job)
-		return fmt.Errorf("you cannot change cluster type between session cluster and job cluster, old spec.job: %q, new spec.job: %q", oldJobSpec, newJobSpec)
+		oldJob, _ := json.Marshal(old.Spec.Job)
+		newJob, _ := json.Marshal(new.Spec.Job)
+		return fmt.Errorf("you cannot change cluster type between session cluster and job cluster, old spec.job: %q, new spec.job: %q", oldJob, newJob)
 	case old.Spec.Job.SavepointsDir == nil || *old.Spec.Job.SavepointsDir == "":
 		return fmt.Errorf("updating job is not allowed when spec.job.savepointsDir was not provided")
 	case old.Spec.Job.SavepointsDir != nil && *old.Spec.Job.SavepointsDir != "" &&
 		(new.Spec.Job.SavepointsDir == nil || *new.Spec.Job.SavepointsDir == ""):
 		return fmt.Errorf("removing savepointsDir is not allowed")
-	case !isBlank(new.Spec.Job.FromSavepoint):
-		return nil
-	default:
-		// In the case of taking savepoint is skipped, check if the savepoint is up-to-date.
-		var oldJob = old.Status.Components.Job
-		var takeSavepointOnUpdate = new.Spec.Job.TakeSavepointOnUpdate == nil || *new.Spec.Job.TakeSavepointOnUpdate
-		var skipTakeSavepoint = !takeSavepointOnUpdate || oldJob.IsStopped()
-		var now = time.Now()
-		if skipTakeSavepoint && oldJob != nil && !oldJob.UpdateReady(new.Spec.Job, now) {
-			oldJobJson, _ := json.Marshal(oldJob)
-			var takeSP, maxStateAge string
-			if new.Spec.Job.TakeSavepointOnUpdate == nil {
-				takeSP = "nil"
-			} else {
-				takeSP = strconv.FormatBool(*new.Spec.Job.TakeSavepointOnUpdate)
-			}
-			if new.Spec.Job.MaxStateAgeToRestoreSeconds == nil {
-				maxStateAge = "nil"
-			} else {
-				maxStateAge = strconv.Itoa(int(*new.Spec.Job.MaxStateAgeToRestoreSeconds))
-			}
-			return fmt.Errorf("cannot update spec: taking savepoint is skipped but no up-to-date savepoint, "+
-				"spec.job.takeSavepointOnUpdate: %v, spec.job.maxStateAgeToRestoreSeconds: %v, job status: %q",
-				takeSP, maxStateAge, oldJobJson)
-		}
 	}
 	return nil
 }
@@ -445,16 +413,8 @@ func (v *Validator) validateJob(jobSpec *JobSpec) error {
 	switch *jobSpec.RestartPolicy {
 	case JobRestartPolicyNever:
 	case JobRestartPolicyFromSavepointOnFailure:
-		if jobSpec.MaxStateAgeToRestoreSeconds == nil {
-			return fmt.Errorf("maxStateAgeToRestoreSeconds must be specified when restartPolicy is set as FromSavepointOnFailure")
-		}
 	default:
 		return fmt.Errorf("invalid job restartPolicy: %v", *jobSpec.RestartPolicy)
-	}
-
-	if jobSpec.TakeSavepointOnUpdate != nil && *jobSpec.TakeSavepointOnUpdate == false &&
-		jobSpec.MaxStateAgeToRestoreSeconds == nil {
-		return fmt.Errorf("maxStateAgeToRestoreSeconds must be specified when takeSavepointOnUpdate is set as false")
 	}
 
 	if jobSpec.CleanupPolicy == nil {
@@ -546,4 +506,27 @@ func (v *Validator) validateMemoryOffHeapMin(
 		}
 	}
 	return nil
+}
+
+// shouldRestartJob returns true if the controller should restart the failed
+// job.
+func shouldRestartJob(
+	restartPolicy *JobRestartPolicy,
+	jobStatus *JobStatus) bool {
+	return restartPolicy != nil &&
+		*restartPolicy == JobRestartPolicyFromSavepointOnFailure &&
+		jobStatus != nil &&
+		jobStatus.State == JobStateFailed &&
+		len(jobStatus.SavepointLocation) > 0
+}
+
+func isJobStopped(status *JobStatus) bool {
+	return status != nil &&
+		(status.State == JobStateSucceeded ||
+			status.State == JobStateFailed ||
+			status.State == JobStateCancelled)
+}
+
+func isJobTerminated(restartPolicy *JobRestartPolicy, jobStatus *JobStatus) bool {
+	return isJobStopped(jobStatus) && !shouldRestartJob(restartPolicy, jobStatus)
 }

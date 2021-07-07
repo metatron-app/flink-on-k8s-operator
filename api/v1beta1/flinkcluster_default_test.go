@@ -45,7 +45,6 @@ func TestSetDefault(t *testing.T) {
 	var defaultJmBlobPort = int32(6124)
 	var defaultJmQueryPort = int32(6125)
 	var defaultJmUIPort = int32(8081)
-	var defaultJmIngressTLSUse = false
 	var defaultTmDataPort = int32(6121)
 	var defaultTmRPCPort = int32(6122)
 	var defaultTmQueryPort = int32(6125)
@@ -53,9 +52,11 @@ func TestSetDefault(t *testing.T) {
 	var defaultJobParallelism = int32(1)
 	var defaultJobNoLoggingToStdout = false
 	var defaultJobRestartPolicy = JobRestartPolicyNever
+	var defatulJobManagerIngressTLSUse = false
 	var defaultMemoryOffHeapRatio = int32(25)
 	var defaultMemoryOffHeapMin = resource.MustParse("600M")
-	var defaultRecreateOnUpdate = true
+	defaultRecreateOnUpdate := new(bool)
+	*defaultRecreateOnUpdate = true
 	var expectedCluster = FlinkCluster{
 		TypeMeta:   metav1.TypeMeta{},
 		ObjectMeta: metav1.ObjectMeta{},
@@ -69,7 +70,7 @@ func TestSetDefault(t *testing.T) {
 				Replicas:    &defaultJmReplicas,
 				AccessScope: "Cluster",
 				Ingress: &JobManagerIngressSpec{
-					UseTLS: &defaultJmIngressTLSUse,
+					UseTLS: &defatulJobManagerIngressTLSUse,
 				},
 				Ports: JobManagerPorts{
 					RPC:   &defaultJmRPCPort,
@@ -114,7 +115,7 @@ func TestSetDefault(t *testing.T) {
 				MountPath: "/etc/hadoop/conf",
 			},
 			EnvVars:          nil,
-			RecreateOnUpdate: &defaultRecreateOnUpdate,
+			RecreateOnUpdate: defaultRecreateOnUpdate,
 		},
 		Status: FlinkClusterStatus{},
 	}
@@ -133,7 +134,6 @@ func TestSetNonDefault(t *testing.T) {
 	var jmBlobPort = int32(8124)
 	var jmQueryPort = int32(8125)
 	var jmUIPort = int32(9081)
-	var jmIngressTLSUse = true
 	var tmDataPort = int32(8121)
 	var tmRPCPort = int32(8122)
 	var tmQueryPort = int32(8125)
@@ -141,14 +141,16 @@ func TestSetNonDefault(t *testing.T) {
 	var jobParallelism = int32(2)
 	var jobNoLoggingToStdout = true
 	var jobRestartPolicy = JobRestartPolicyFromSavepointOnFailure
+	var jobManagerIngressTLSUse = true
 	var memoryOffHeapRatio = int32(50)
 	var memoryOffHeapMin = resource.MustParse("600M")
-	var recreateOnUpdate = false
 	var securityContextUserGroup = int64(9999)
 	var securityContext = corev1.PodSecurityContext{
 		RunAsUser:  &securityContextUserGroup,
 		RunAsGroup: &securityContextUserGroup,
 	}
+	defaultRecreateOnUpdate := new(bool)
+	*defaultRecreateOnUpdate = true
 	var cluster = FlinkCluster{
 		TypeMeta:   metav1.TypeMeta{},
 		ObjectMeta: metav1.ObjectMeta{},
@@ -162,7 +164,7 @@ func TestSetNonDefault(t *testing.T) {
 				Replicas:    &jmReplicas,
 				AccessScope: "Cluster",
 				Ingress: &JobManagerIngressSpec{
-					UseTLS: &jmIngressTLSUse,
+					UseTLS: &jobManagerIngressTLSUse,
 				},
 				Ports: JobManagerPorts{
 					RPC:   &jmRPCPort,
@@ -206,8 +208,7 @@ func TestSetNonDefault(t *testing.T) {
 			HadoopConfig: &HadoopConfig{
 				MountPath: "/opt/flink/hadoop/conf",
 			},
-			EnvVars:          nil,
-			RecreateOnUpdate: &recreateOnUpdate,
+			EnvVars: nil,
 		},
 		Status: FlinkClusterStatus{},
 	}
@@ -227,7 +228,7 @@ func TestSetNonDefault(t *testing.T) {
 				Replicas:    &jmReplicas,
 				AccessScope: "Cluster",
 				Ingress: &JobManagerIngressSpec{
-					UseTLS: &jmIngressTLSUse,
+					UseTLS: &jobManagerIngressTLSUse,
 				},
 				Ports: JobManagerPorts{
 					RPC:   &jmRPCPort,
@@ -272,7 +273,7 @@ func TestSetNonDefault(t *testing.T) {
 				MountPath: "/opt/flink/hadoop/conf",
 			},
 			EnvVars:          nil,
-			RecreateOnUpdate: &recreateOnUpdate,
+			RecreateOnUpdate: defaultRecreateOnUpdate,
 		},
 		Status: FlinkClusterStatus{},
 	}
