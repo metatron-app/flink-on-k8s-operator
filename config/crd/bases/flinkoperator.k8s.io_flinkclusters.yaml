@@ -715,6 +715,10 @@ spec:
                     type: array
                   jarFile:
                     type: string
+                  maxStateAgeToRestoreSeconds:
+                    format: int32
+                    minimum: 0
+                    type: integer
                   noLoggingToStdout:
                     type: boolean
                   parallelism:
@@ -807,7 +811,7 @@ spec:
                             type: string
                         type: object
                     type: object
-                  takeSavepointOnUpgrade:
+                  takeSavepointOnUpdate:
                     type: boolean
                   volumeMounts:
                     items:
@@ -5368,9 +5372,6 @@ spec:
             type: object
           status:
             properties:
-              collisionCount:
-                format: int32
-                type: integer
               components:
                 properties:
                   configMap:
@@ -5385,15 +5386,15 @@ spec:
                     type: object
                   job:
                     properties:
+                      deployTime:
+                        type: string
+                      endTime:
+                        type: string
+                      finalSavepoint:
+                        type: boolean
                       fromSavepoint:
                         type: string
                       id:
-                        type: string
-                      lastSavepointTime:
-                        type: string
-                      lastSavepointTriggerID:
-                        type: string
-                      lastSavepointTriggerTime:
                         type: string
                       name:
                         type: string
@@ -5404,6 +5405,10 @@ spec:
                         format: int32
                         type: integer
                       savepointLocation:
+                        type: string
+                      savepointTime:
+                        type: string
+                      startTime:
                         type: string
                       state:
                         type: string
@@ -5482,12 +5487,18 @@ spec:
                 - state
                 - updateTime
                 type: object
-              currentRevision:
-                type: string
               lastUpdateTime:
                 type: string
-              nextRevision:
-                type: string
+              revision:
+                properties:
+                  collisionCount:
+                    format: int32
+                    type: integer
+                  currentRevision:
+                    type: string
+                  nextRevision:
+                    type: string
+                type: object
               savepoint:
                 properties:
                   jobID:

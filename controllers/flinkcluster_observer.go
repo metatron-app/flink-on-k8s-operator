@@ -55,13 +55,10 @@ type ObservedClusterState struct {
 	jmService         *corev1.Service
 	jmIngress         *extensionsv1beta1.Ingress
 	tmStatefulSet     *appsv1.StatefulSet
-	job               *batchv1.Job
-	jobPod            *corev1.Pod
-	flinkJobStatus    FlinkJobStatus
-	flinkJobSubmitLog *FlinkJobSubmitLog
-	savepoint         *flinkclient.SavepointStatus
-	revisionStatus    *RevisionStatus
-	savepointErr      error
+	flinkJob          FlinkJob
+	flinkJobSubmitter FlinkJobSubmitter
+	savepoint         Savepoint
+	revision          Revision
 	observeTime       time.Time
 	updateState       UpdateState
 }
