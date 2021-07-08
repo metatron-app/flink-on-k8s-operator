@@ -19,8 +19,9 @@ ENV GOROOT=/usr/local/go
 ENV PATH=${PATH}:${GOROOT}/bin
 
 # Install Kubebuilder
-RUN curl -sL https://go.kubebuilder.io/dl/2.0.1/linux/amd64 | tar -xz -C /usr/local/ \
-    && mv /usr/local/kubebuilder_2.0.1_linux_amd64 /usr/local/kubebuilder
+ENV KUBEBUILDER_VERSION=2.3.2
+RUN curl -sL https://go.kubebuilder.io/dl/${KUBEBUILDER_VERSION}/linux/amd64 | tar -xz -C /usr/local/ \
+    && mv /usr/local/kubebuilder_${KUBEBUILDER_VERSION}_linux_amd64 /usr/local/kubebuilder
 ENV PATH=${PATH}:/usr/local/kubebuilder/bin
 
 WORKDIR /workspace/
