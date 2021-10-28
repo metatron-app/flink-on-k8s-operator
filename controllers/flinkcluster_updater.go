@@ -23,12 +23,14 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"k8s.io/apimachinery/pkg/types"
 	"reflect"
 	"time"
 
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+
 	"github.com/go-logr/logr"
-	v1beta1 "github.com/googlecloudplatform/flink-operator/api/v1beta1"
+	v1beta1 "github.com/spotify/flink-on-k8s-operator/api/v1beta1"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/client-go/tools/record"
@@ -184,7 +186,6 @@ func (updater *ClusterStatusUpdater) createStatusChangeEvent(
 	}
 }
 
-// TODO: Need to organize
 func (updater *ClusterStatusUpdater) deriveClusterStatus(
 	recorded *v1beta1.FlinkClusterStatus,
 	observed *ObservedClusterState) v1beta1.FlinkClusterStatus {
@@ -199,7 +200,7 @@ func (updater *ClusterStatusUpdater) deriveClusterStatus(
 		recorded.Components.ConfigMap.DeepCopyInto(&status.Components.ConfigMap)
 		status.Components.ConfigMap.State = v1beta1.ComponentStateUpdating
 	} else if observedConfigMap != nil {
-		status.Components.ConfigMap.Name = observedConfigMap.ObjectMeta.Name
+		status.Components.ConfigMap.Name = observedConfigMap.Name
 		status.Components.ConfigMap.State = v1beta1.ComponentStateReady
 	} else if recorded.Components.ConfigMap.Name != "" {
 		status.Components.ConfigMap =
@@ -215,7 +216,7 @@ func (updater *ClusterStatusUpdater) deriveClusterStatus(
 		recorded.Components.JobManagerStatefulSet.DeepCopyInto(&status.Components.JobManagerStatefulSet)
 		status.Components.JobManagerStatefulSet.State = v1beta1.ComponentStateUpdating
 	} else if observedJmStatefulSet != nil {
-		status.Components.JobManagerStatefulSet.Name = observedJmStatefulSet.ObjectMeta.Name
+		status.Components.JobManagerStatefulSet.Name = observedJmStatefulSet.Name
 		status.Components.JobManagerStatefulSet.State = getStatefulSetState(observedJmStatefulSet)
 		if status.Components.JobManagerStatefulSet.State == v1beta1.ComponentStateReady {
 			runningComponents++
@@ -234,22 +235,21 @@ func (updater *ClusterStatusUpdater) deriveClusterStatus(
 		recorded.Components.JobManagerService.DeepCopyInto(&status.Components.JobManagerService)
 		status.Components.JobManagerService.State = v1beta1.ComponentStateUpdating
 	} else if observedJmService != nil {
-		var state string
 		var nodePort int32
+		var loadBalancerIngress []corev1.LoadBalancerIngress
+		state := v1beta1.ComponentStateNotReady
+
 		switch observedJmService.Spec.Type {
 		case corev1.ServiceTypeClusterIP:
 			if observedJmService.Spec.ClusterIP != "" {
 				state = v1beta1.ComponentStateReady
 				runningComponents++
-			} else {
-				state = v1beta1.ComponentStateNotReady
 			}
 		case corev1.ServiceTypeLoadBalancer:
 			if len(observedJmService.Status.LoadBalancer.Ingress) > 0 {
 				state = v1beta1.ComponentStateReady
 				runningComponents++
-			} else {
-				state = v1beta1.ComponentStateNotReady
+				loadBalancerIngress = observedJmService.Status.LoadBalancer.Ingress
 			}
 		case corev1.ServiceTypeNodePort:
 			if len(observedJmService.Spec.Ports) > 0 {
@@ -260,16 +260,15 @@ func (updater *ClusterStatusUpdater) deriveClusterStatus(
 						nodePort = port.NodePort
 					}
 				}
-			} else {
-				state = v1beta1.ComponentStateNotReady
 			}
 		}
 
 		status.Components.JobManagerService =
 			v1beta1.JobManagerServiceStatus{
-				Name:     observedJmService.ObjectMeta.Name,
-				State:    state,
-				NodePort: nodePort,
+				Name:                observedJmService.Name,
+				State:               state,
+				NodePort:            nodePort,
+				LoadBalancerIngress: loadBalancerIngress,
 			}
 	} else if recorded.Components.JobManagerService.Name != "" {
 		status.Components.JobManagerService =
@@ -349,7 +348,7 @@ func (updater *ClusterStatusUpdater) deriveClusterStatus(
 
 		status.Components.JobManagerIngress =
 			&v1beta1.JobManagerIngressStatus{
-				Name:  observedJmIngress.ObjectMeta.Name,
+				Name:  observedJmIngress.Name,
 				State: state,
 				URLs:  urls,
 			}
@@ -369,7 +368,7 @@ func (updater *ClusterStatusUpdater) deriveClusterStatus(
 		status.Components.TaskManagerStatefulSet.State = v1beta1.ComponentStateUpdating
 	} else if observedTmStatefulSet != nil {
 		status.Components.TaskManagerStatefulSet.Name =
-			observedTmStatefulSet.ObjectMeta.Name
+			observedTmStatefulSet.Name
 		status.Components.TaskManagerStatefulSet.State =
 			getStatefulSetState(observedTmStatefulSet)
 		if status.Components.TaskManagerStatefulSet.State ==
@@ -385,10 +384,24 @@ func (updater *ClusterStatusUpdater) deriveClusterStatus(
 	}
 
 	// Derive the new cluster state.
+	var jobStatus = recorded.Components.Job
 	switch recorded.State {
 	case "", v1beta1.ClusterStateCreating:
 		if runningComponents < totalComponents {
 			status.State = v1beta1.ClusterStateCreating
+			if jobStatus.IsStopped() {
+				var policy = observed.cluster.Spec.Job.CleanupPolicy
+				if jobStatus.State == v1beta1.JobStateSucceeded &&
+					policy.AfterJobSucceeds != v1beta1.CleanupActionKeepCluster {
+					status.State = v1beta1.ClusterStateStopping
+				} else if jobStatus.State == v1beta1.JobStateFailed &&
+					policy.AfterJobFails != v1beta1.CleanupActionKeepCluster {
+					status.State = v1beta1.ClusterStateStopping
+				} else if jobStatus.State == v1beta1.JobStateCancelled &&
+					policy.AfterJobCancelled != v1beta1.CleanupActionKeepCluster {
+					status.State = v1beta1.ClusterStateStopping
+				}
+			}
 		} else {
 			status.State = v1beta1.ClusterStateRunning
 		}
@@ -406,7 +419,6 @@ func (updater *ClusterStatusUpdater) deriveClusterStatus(
 		}
 	case v1beta1.ClusterStateRunning,
 		v1beta1.ClusterStateReconciling:
-		var jobStatus = recorded.Components.Job
 		if shouldUpdateCluster(observed) {
 			status.State = v1beta1.ClusterStateUpdating
 		} else if !recorded.Revision.IsUpdateTriggered() && jobStatus.IsStopped() {
@@ -488,14 +500,14 @@ func (updater *ClusterStatusUpdater) deriveClusterStatus(
 func (updater *ClusterStatusUpdater) getFlinkJobID() *string {
 	// Observed from active job manager.
 	var observedFlinkJob = updater.observed.flinkJob.status
-	if observedFlinkJob != nil && len(observedFlinkJob.ID) > 0 {
-		return &observedFlinkJob.ID
+	if observedFlinkJob != nil && len(observedFlinkJob.Id) > 0 {
+		return &observedFlinkJob.Id
 	}
 
 	// Observed from job submitter (when Flink API is not ready).
 	var observedJobSubmitterLog = updater.observed.flinkJobSubmitter.log
-	if observedJobSubmitterLog != nil && observedJobSubmitterLog.JobID != "" {
-		return &observedJobSubmitterLog.JobID
+	if observedJobSubmitterLog != nil && observedJobSubmitterLog.jobID != "" {
+		return &observedJobSubmitterLog.jobID
 	}
 
 	// Recorded.
@@ -529,8 +541,12 @@ func (updater *ClusterStatusUpdater) deriveJobStatus() *v1beta1.JobStatus {
 	} else {
 		newJob = new(v1beta1.JobStatus)
 	}
+
+	if observedSubmitter.job != nil {
+		newJob.SubmitterName = observedSubmitter.job.Name
+	}
+
 	var newJobState string
-	var newJobID string
 	switch {
 	case oldJob == nil:
 		newJobState = v1beta1.JobStatePending
@@ -544,12 +560,13 @@ func (updater *ClusterStatusUpdater) deriveJobStatus() *v1beta1.JobStatus {
 		newJobState = oldJob.State
 	// Derive the job state from the observed Flink job, if it exists.
 	case observedFlinkJob != nil:
-		newJobState = getFlinkJobDeploymentState(observedFlinkJob.Status)
+		newJobState = getFlinkJobDeploymentState(observedFlinkJob.State)
 		// Unexpected Flink job state
 		if newJobState == "" {
-			panic(fmt.Sprintf("Unknown Flink job status: %s", observedFlinkJob.Status))
+			panic(fmt.Sprintf("Unknown Flink job status: %s", observedFlinkJob.State))
 		}
-		newJobID = observedFlinkJob.ID
+		newJob.ID = observedFlinkJob.Id
+		newJob.Name = observedFlinkJob.Name
 	// When Flink job not found in JobManager or JobManager is unavailable
 	case isFlinkAPIReady(observed.flinkJob.list):
 		if oldJob.State == v1beta1.JobStateRunning {
@@ -558,28 +575,27 @@ func (updater *ClusterStatusUpdater) deriveJobStatus() *v1beta1.JobStatus {
 		}
 		fallthrough
 	default:
+		// Maintain the job state as recorded if job is not being deployed.
 		if oldJob.State != v1beta1.JobStateDeploying {
 			newJobState = oldJob.State
 			break
 		}
-		// Job submitter is deployed but tracking failed.
-		var submitterState = observedSubmitter.getState()
-		if submitterState == JobDeployStateUnknown {
+		// Job must be in deployment but the submitter not found or tracking failed.
+		var jobDeployState = observedSubmitter.getState()
+		if observedSubmitter.job == nil || jobDeployState == JobDeployStateUnknown {
 			newJobState = v1beta1.JobStateLost
 			break
 		}
 		// Case in which the job submission clearly fails even if it is not confirmed by JobManager
 		// Job submitter is deployed but failed.
-		if submitterState == JobDeployStateFailed {
+		if jobDeployState == JobDeployStateFailed {
 			newJobState = v1beta1.JobStateDeployFailed
 			break
 		}
 		newJobState = oldJob.State
 	}
+	// Update State
 	newJob.State = newJobState
-	if newJobID != "" {
-		newJob.ID = newJobID
-	}
 
 	// Derived new job status if the state is changed.
 	if oldJob == nil || oldJob.State != newJob.State {
@@ -587,25 +603,40 @@ func (updater *ClusterStatusUpdater) deriveJobStatus() *v1beta1.JobStatus {
 		switch {
 		case newJob.IsPending():
 			newJob.DeployTime = ""
-			if newJob.State == v1beta1.JobStateUpdating {
+			switch newJob.State {
+			case v1beta1.JobStateUpdating:
 				newJob.RestartCount = 0
-			} else if newJob.State == v1beta1.JobStateRestarting {
+			case v1beta1.JobStateRestarting:
 				newJob.RestartCount++
 			}
 		case newJob.State == v1beta1.JobStateRunning:
 			setTimestamp(&newJob.StartTime)
-			newJob.EndTime = ""
+			newJob.CompletionTime = nil
 			// When job started, the savepoint is not the final state of the job any more.
 			if oldJob.FinalSavepoint {
 				newJob.FinalSavepoint = false
 			}
 		case newJob.IsStopped():
-			if newJob.EndTime == "" {
-				setTimestamp(&newJob.EndTime)
+			if newJob.CompletionTime.IsZero() {
+				now := metav1.Now()
+				newJob.CompletionTime = &now
 			}
 			// When tracking failed, we cannot guarantee if the savepoint is the final job state.
 			if newJob.State == v1beta1.JobStateLost && oldJob.FinalSavepoint {
 				newJob.FinalSavepoint = false
+			}
+		case newJob.IsFailed():
+			if len(newJob.FailureReasons) == 0 {
+				newJob.FailureReasons = []string{}
+				exceptions := observed.flinkJob.exceptions
+				if exceptions != nil && len(exceptions.Exceptions) > 0 {
+					for _, e := range exceptions.Exceptions {
+						newJob.FailureReasons = append(newJob.FailureReasons, e.Exception)
+					}
+				}
+				if observedSubmitter.log != nil {
+					newJob.FailureReasons = append(newJob.FailureReasons, observedSubmitter.log.message)
+				}
 			}
 		}
 	}
@@ -667,8 +698,7 @@ func (updater *ClusterStatusUpdater) isStatusChanged(
 			newStatus.Components.JobManagerStatefulSet)
 		changed = true
 	}
-	if newStatus.Components.JobManagerService !=
-		currentStatus.Components.JobManagerService {
+	if !reflect.DeepEqual(newStatus.Components.JobManagerService, currentStatus.Components.JobManagerService) {
 		updater.log.Info(
 			"JobManager service status changed",
 			"current",
@@ -762,6 +792,7 @@ func (updater *ClusterStatusUpdater) updateClusterStatus(
 	var cluster = v1beta1.FlinkCluster{}
 	updater.observed.cluster.DeepCopyInto(&cluster)
 	cluster.Status = status
+	updater.log.Info("(ClusterStatusUpdater) Updating cluster status", "clusterClone", cluster, "cluster.Status", cluster.Status)
 	err := updater.k8sClient.Status().Update(updater.context, &cluster)
 	// Clear control annotation after status update is complete.
 	updater.clearControlAnnotation(status.Control)
@@ -788,7 +819,7 @@ func (updater *ClusterStatusUpdater) clearControlAnnotation(newControlStatus *v1
 		if err != nil {
 			return err
 		}
-		return updater.k8sClient.Patch(updater.context, updater.observed.cluster, client.ConstantPatch(types.MergePatchType, patchBytes))
+		return updater.k8sClient.Patch(updater.context, updater.observed.cluster, client.RawPatch(types.MergePatchType, patchBytes))
 	}
 
 	return nil
@@ -808,30 +839,27 @@ func (updater *ClusterStatusUpdater) deriveSavepointStatus(
 	var errMsg string
 
 	// Update the savepoint status when observed savepoint is found.
-	if s.State == v1beta1.SavepointStateInProgress && observedSavepoint != nil {
+	if s.State == v1beta1.SavepointStateInProgress {
+		// Derive the state from the observed savepoint in JobManager.
+		status := observedSavepoint.status
 		switch {
-		case observedSavepoint.status.IsSuccessful():
+		case status != nil && status.IsSuccessful():
 			s.State = v1beta1.SavepointStateSucceeded
-		case observedSavepoint.status.IsFailed():
+		case status != nil && status.IsFailed():
 			s.State = v1beta1.SavepointStateFailed
 			errMsg = fmt.Sprintf("Savepoint error: %v", observedSavepoint.status.FailureCause.StackTrace)
 		case observedSavepoint.error != nil:
 			s.State = v1beta1.SavepointStateFailed
 			errMsg = fmt.Sprintf("Failed to get savepoint status: %v", observedSavepoint.error)
 		}
-	}
-
-	// Check failure conditions of savepoint in progress.
-	if s.State == v1beta1.SavepointStateInProgress {
+		// Derive the failure state from Flink job status.
+		// Append additional error message if it already exists.
 		switch {
 		case newJobStatus.IsStopped():
-			errMsg = "Flink job is stopped."
+			errMsg = "Flink job is stopped: " + errMsg
 			s.State = v1beta1.SavepointStateFailed
-		case flinkJobID == nil:
-			errMsg = "Flink job is not identified."
-			s.State = v1beta1.SavepointStateFailed
-		case flinkJobID != nil && (recordedSavepointStatus.TriggerID != "" && *flinkJobID != recordedSavepointStatus.JobID):
-			errMsg = "Savepoint triggered Flink job is lost."
+		case flinkJobID == nil || *flinkJobID != recordedSavepointStatus.JobID:
+			errMsg = "Savepoint triggered Flink job is lost: " + errMsg
 			s.State = v1beta1.SavepointStateFailed
 		}
 	}
@@ -839,7 +867,7 @@ func (updater *ClusterStatusUpdater) deriveSavepointStatus(
 	// https://github.com/kubernetes/apimachinery/blob/57f2a0733447cfd41294477d833cce6580faaca3/pkg/apis/meta/v1/types.go#L1376
 	// Make up message.
 	if errMsg != "" {
-		if s.TriggerReason == v1beta1.SavepointTriggerReasonUpdate {
+		if s.TriggerReason == v1beta1.SavepointReasonUpdate {
 			errMsg =
 				"Failed to take savepoint for update. " +
 					"The update process is being postponed until a savepoint is available. " + errMsg
@@ -879,14 +907,14 @@ func deriveControlStatus(
 			} else if newJob.IsStopped() {
 				c.Message = "Aborted job cancellation: savepoint is not completed, but job is stopped already."
 				c.State = v1beta1.ControlStateFailed
-			} else if newSavepoint.IsFailed() && newSavepoint.TriggerReason == v1beta1.SavepointTriggerReasonJobCancel {
+			} else if newSavepoint.IsFailed() && newSavepoint.TriggerReason == v1beta1.SavepointReasonJobCancel {
 				c.Message = "Aborted job cancellation: failed to take savepoint."
 				c.State = v1beta1.ControlStateFailed
 			}
 		case v1beta1.ControlNameSavepoint:
 			if newSavepoint.State == v1beta1.SavepointStateSucceeded {
 				c.State = v1beta1.ControlStateSucceeded
-			} else if newSavepoint.IsFailed() && newSavepoint.TriggerReason == v1beta1.SavepointTriggerReasonUserRequested {
+			} else if newSavepoint.IsFailed() && newSavepoint.TriggerReason == v1beta1.SavepointReasonUserRequested {
 				c.State = v1beta1.ControlStateFailed
 			}
 		}

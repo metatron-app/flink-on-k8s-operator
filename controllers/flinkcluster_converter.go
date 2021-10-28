@@ -19,6 +19,7 @@ package controllers
 import (
 	"fmt"
 	"math"
+	"path"
 	"regexp"
 	"sort"
 	"strconv"
@@ -27,35 +28,42 @@ import (
 
 	"k8s.io/apimachinery/pkg/api/resource"
 
-	v1beta1 "github.com/googlecloudplatform/flink-operator/api/v1beta1"
-	"github.com/googlecloudplatform/flink-operator/controllers/model"
+	v1beta1 "github.com/spotify/flink-on-k8s-operator/api/v1beta1"
+	"github.com/spotify/flink-on-k8s-operator/controllers/model"
 
 	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
-	extensionsv1beta1 "k8s.io/api/extensions/v1beta1"
+	networkingv1 "k8s.io/api/networking/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
+
+	"github.com/hashicorp/go-version"
 )
 
 // Converter which converts the FlinkCluster spec to the desired
 // underlying Kubernetes resource specs.
 
 const (
-	delayDeleteClusterMinutes int32 = 5
-	flinkConfigMapPath              = "/opt/flink/conf"
-	flinkConfigMapVolume            = "flink-config-volume"
-	gcpServiceAccountVolume         = "gcp-service-account-volume"
-	hadoopConfigVolume              = "hadoop-config-volume"
+	preStopSleepSeconds     = 30
+	flinkConfigMapPath      = "/opt/flink/conf"
+	flinkConfigMapVolume    = "flink-config-volume"
+	submitJobScriptPath     = "/opt/flink-operator/submit-job.sh"
+	gcpServiceAccountVolume = "gcp-service-account-volume"
+	hadoopConfigVolume      = "hadoop-config-volume"
 )
 
-var flinkSysProps = map[string]struct{}{
-	"jobmanager.rpc.address": {},
-	"jobmanager.rpc.port":    {},
-	"blob.server.port":       {},
-	"query.server.port":      {},
-	"rest.port":              {},
-}
+var (
+	terminationGracePeriodSeconds int64 = 60
+	flinkSysProps                       = map[string]struct{}{
+		"jobmanager.rpc.address": {},
+		"jobmanager.rpc.port":    {},
+		"blob.server.port":       {},
+		"query.server.port":      {},
+		"rest.port":              {},
+	}
+	v10, _ = version.NewVersion("1.10")
+)
 
 // Gets the desired state of a cluster.
 func getDesiredClusterState(
@@ -85,8 +93,8 @@ func getDesiredJobManagerStatefulSet(
 		return nil
 	}
 
-	var clusterNamespace = flinkCluster.ObjectMeta.Namespace
-	var clusterName = flinkCluster.ObjectMeta.Name
+	var clusterNamespace = flinkCluster.Namespace
+	var clusterName = flinkCluster.Name
 	var clusterSpec = flinkCluster.Spec
 	var imageSpec = clusterSpec.Image
 	var serviceAccount = clusterSpec.ServiceAccountName
@@ -112,50 +120,7 @@ func getDesiredJobManagerStatefulSet(
 	confVol, confMount = convertFlinkConfig(clusterName)
 	volumes = append(jobManagerSpec.Volumes, *confVol)
 	volumeMounts = append(jobManagerSpec.VolumeMounts, *confMount)
-	var envVars = []corev1.EnvVar{
-		{
-			Name: "JOB_MANAGER_CPU_LIMIT",
-			ValueFrom: &corev1.EnvVarSource{
-				ResourceFieldRef: &corev1.ResourceFieldSelector{
-					ContainerName: "jobmanager",
-					Resource:      "limits.cpu",
-					Divisor:       resource.MustParse("1m"),
-				},
-			},
-		},
-		{
-			Name: "JOB_MANAGER_MEMORY_LIMIT",
-			ValueFrom: &corev1.EnvVarSource{
-				ResourceFieldRef: &corev1.ResourceFieldSelector{
-					ContainerName: "jobmanager",
-					Resource:      "limits.memory",
-					Divisor:       resource.MustParse("1Mi"),
-				},
-			},
-		},
-	}
-	var readinessProbe = corev1.Probe{
-		Handler: corev1.Handler{
-			TCPSocket: &corev1.TCPSocketAction{
-				Port: intstr.FromInt(int(*jobManagerSpec.Ports.RPC)),
-			},
-		},
-		TimeoutSeconds:      10,
-		InitialDelaySeconds: 5,
-		PeriodSeconds:       5,
-		FailureThreshold:    60,
-	}
-	var livenessProbe = corev1.Probe{
-		Handler: corev1.Handler{
-			TCPSocket: &corev1.TCPSocketAction{
-				Port: intstr.FromInt(int(*jobManagerSpec.Ports.RPC)),
-			},
-		},
-		TimeoutSeconds:      10,
-		InitialDelaySeconds: 5,
-		PeriodSeconds:       60,
-		FailureThreshold:    5,
-	}
+	var envVars []corev1.EnvVar
 
 	// Hadoop config.
 	var hcVolume, hcMount, hcEnv = convertHadoopConfig(clusterSpec.HadoopConfig)
@@ -182,31 +147,39 @@ func getDesiredJobManagerStatefulSet(
 	}
 
 	envVars = append(envVars, flinkCluster.Spec.EnvVars...)
-	var containers = []corev1.Container{corev1.Container{
+	var containers = []corev1.Container{{
 		Name:            "jobmanager",
 		Image:           imageSpec.Name,
 		ImagePullPolicy: imageSpec.PullPolicy,
 		Args:            []string{"jobmanager"},
 		Ports:           ports,
-		LivenessProbe:   &livenessProbe,
-		ReadinessProbe:  &readinessProbe,
+		LivenessProbe:   jobManagerSpec.LivenessProbe,
+		ReadinessProbe:  jobManagerSpec.ReadinessProbe,
 		Resources:       jobManagerSpec.Resources,
 		Env:             envVars,
 		EnvFrom:         flinkCluster.Spec.EnvFrom,
 		VolumeMounts:    volumeMounts,
+		Lifecycle: &corev1.Lifecycle{
+			PreStop: &corev1.Handler{
+				Exec: &corev1.ExecAction{
+					Command: []string{"sleep", strconv.Itoa(preStopSleepSeconds)},
+				},
+			},
+		},
 	}}
 
 	containers = append(containers, jobManagerSpec.Sidecars...)
 
 	var podSpec = corev1.PodSpec{
-		InitContainers:     convertJobManagerInitContainers(&jobManagerSpec),
-		Containers:         containers,
-		Volumes:            volumes,
-		NodeSelector:       jobManagerSpec.NodeSelector,
-		Tolerations:        jobManagerSpec.Tolerations,
-		ImagePullSecrets:   imageSpec.PullSecrets,
-		SecurityContext:    securityContext,
-		ServiceAccountName: getServiceAccountName(serviceAccount),
+		InitContainers:                convertJobManagerInitContainers(&jobManagerSpec, saMount, saEnv),
+		Containers:                    containers,
+		Volumes:                       volumes,
+		NodeSelector:                  jobManagerSpec.NodeSelector,
+		Tolerations:                   jobManagerSpec.Tolerations,
+		ImagePullSecrets:              imageSpec.PullSecrets,
+		SecurityContext:               securityContext,
+		ServiceAccountName:            getServiceAccountName(serviceAccount),
+		TerminationGracePeriodSeconds: &terminationGracePeriodSeconds,
 	}
 
 	var jobManagerStatefulSet = &appsv1.StatefulSet{
@@ -241,8 +214,8 @@ func getDesiredJobManagerService(
 		return nil
 	}
 
-	var clusterNamespace = flinkCluster.ObjectMeta.Namespace
-	var clusterName = flinkCluster.ObjectMeta.Name
+	var clusterNamespace = flinkCluster.Namespace
+	var clusterName = flinkCluster.Name
 	var jobManagerSpec = flinkCluster.Spec.JobManager
 	var rpcPort = corev1.ServicePort{
 		Name:       "rpc",
@@ -286,7 +259,10 @@ func getDesiredJobManagerService(
 	case v1beta1.AccessScopeVPC:
 		jobManagerService.Spec.Type = corev1.ServiceTypeLoadBalancer
 		jobManagerService.Annotations =
-			map[string]string{"cloud.google.com/load-balancer-type": "Internal"}
+			map[string]string{
+				"networking.gke.io/load-balancer-type":                         "Internal",
+				"networking.gke.io/internal-load-balancer-allow-global-access": "true",
+			}
 	case v1beta1.AccessScopeExternal:
 		jobManagerService.Spec.Type = corev1.ServiceTypeLoadBalancer
 	case v1beta1.AccessScopeNodePort:
@@ -305,7 +281,7 @@ func getDesiredJobManagerService(
 
 // Gets the desired JobManager ingress spec from a cluster spec.
 func getDesiredJobManagerIngress(
-	flinkCluster *v1beta1.FlinkCluster) *extensionsv1beta1.Ingress {
+	flinkCluster *v1beta1.FlinkCluster) *networkingv1.Ingress {
 	var jobManagerIngressSpec = flinkCluster.Spec.JobManager.Ingress
 	if jobManagerIngressSpec == nil {
 		return nil
@@ -315,21 +291,21 @@ func getDesiredJobManagerIngress(
 		return nil
 	}
 
-	var clusterNamespace = flinkCluster.ObjectMeta.Namespace
-	var clusterName = flinkCluster.ObjectMeta.Name
+	var clusterNamespace = flinkCluster.Namespace
+	var clusterName = flinkCluster.Name
 	var jobManagerServiceName = getJobManagerServiceName(clusterName)
 	var jobManagerServiceUIPort = intstr.FromString("ui")
 	var ingressName = getJobManagerIngressName(clusterName)
 	var ingressAnnotations = jobManagerIngressSpec.Annotations
 	var ingressHost string
-	var ingressTLS []extensionsv1beta1.IngressTLS
+	var ingressTLS []networkingv1.IngressTLS
 	var labels = mergeLabels(
 		getComponentLabels(*flinkCluster, "jobmanager"),
 		getRevisionHashLabels(&flinkCluster.Status.Revision))
 	if jobManagerIngressSpec.HostFormat != nil {
 		ingressHost = getJobManagerIngressHost(*jobManagerIngressSpec.HostFormat, clusterName)
 	}
-	if jobManagerIngressSpec.UseTLS != nil && *jobManagerIngressSpec.UseTLS == true {
+	if jobManagerIngressSpec.UseTLS != nil && *jobManagerIngressSpec.UseTLS {
 		var secretName string
 		var hosts []string
 		if ingressHost != "" {
@@ -339,13 +315,13 @@ func getDesiredJobManagerIngress(
 			secretName = *jobManagerIngressSpec.TLSSecretName
 		}
 		if hosts != nil || secretName != "" {
-			ingressTLS = []extensionsv1beta1.IngressTLS{{
+			ingressTLS = []networkingv1.IngressTLS{{
 				Hosts:      hosts,
 				SecretName: secretName,
 			}}
 		}
 	}
-	var jobManagerIngress = &extensionsv1beta1.Ingress{
+	var jobManagerIngress = &networkingv1.Ingress{
 		ObjectMeta: metav1.ObjectMeta{
 			Namespace: clusterNamespace,
 			Name:      ingressName,
@@ -354,17 +330,22 @@ func getDesiredJobManagerIngress(
 			Labels:      labels,
 			Annotations: ingressAnnotations,
 		},
-		Spec: extensionsv1beta1.IngressSpec{
+		Spec: networkingv1.IngressSpec{
 			TLS: ingressTLS,
-			Rules: []extensionsv1beta1.IngressRule{{
+			Rules: []networkingv1.IngressRule{{
 				Host: ingressHost,
-				IngressRuleValue: extensionsv1beta1.IngressRuleValue{
-					HTTP: &extensionsv1beta1.HTTPIngressRuleValue{
-						Paths: []extensionsv1beta1.HTTPIngressPath{{
-							Path: "/",
-							Backend: extensionsv1beta1.IngressBackend{
-								ServiceName: jobManagerServiceName,
-								ServicePort: jobManagerServiceUIPort,
+				IngressRuleValue: networkingv1.IngressRuleValue{
+					HTTP: &networkingv1.HTTPIngressRuleValue{
+						Paths: []networkingv1.HTTPIngressPath{{
+							Path: "/*",
+							Backend: networkingv1.IngressBackend{
+								Service: &networkingv1.IngressServiceBackend{
+									Name: jobManagerServiceName,
+									Port: networkingv1.ServiceBackendPort{
+										Name:   jobManagerServiceName,
+										Number: jobManagerServiceUIPort.IntVal,
+									},
+								},
 							},
 						}},
 					},
@@ -384,8 +365,8 @@ func getDesiredTaskManagerStatefulSet(
 		return nil
 	}
 
-	var clusterNamespace = flinkCluster.ObjectMeta.Namespace
-	var clusterName = flinkCluster.ObjectMeta.Name
+	var clusterNamespace = flinkCluster.Namespace
+	var clusterName = flinkCluster.Name
 	var clusterSpec = flinkCluster.Spec
 	var imageSpec = flinkCluster.Spec.Image
 	var serviceAccount = clusterSpec.ServiceAccountName
@@ -435,28 +416,6 @@ func getDesiredTaskManagerStatefulSet(
 			},
 		},
 	}
-	var readinessProbe = corev1.Probe{
-		Handler: corev1.Handler{
-			TCPSocket: &corev1.TCPSocketAction{
-				Port: intstr.FromInt(int(*taskManagerSpec.Ports.RPC)),
-			},
-		},
-		TimeoutSeconds:      10,
-		InitialDelaySeconds: 5,
-		PeriodSeconds:       5,
-		FailureThreshold:    60,
-	}
-	var livenessProbe = corev1.Probe{
-		Handler: corev1.Handler{
-			TCPSocket: &corev1.TCPSocketAction{
-				Port: intstr.FromInt(int(*taskManagerSpec.Ports.RPC)),
-			},
-		},
-		TimeoutSeconds:      10,
-		InitialDelaySeconds: 5,
-		PeriodSeconds:       60,
-		FailureThreshold:    5,
-	}
 
 	// Hadoop config.
 	var hcVolume, hcMount, hcEnv = convertHadoopConfig(clusterSpec.HadoopConfig)
@@ -483,30 +442,39 @@ func getDesiredTaskManagerStatefulSet(
 	}
 	envVars = append(envVars, flinkCluster.Spec.EnvVars...)
 
-	var containers = []corev1.Container{corev1.Container{
+	var containers = []corev1.Container{{
 		Name:            "taskmanager",
 		Image:           imageSpec.Name,
 		ImagePullPolicy: imageSpec.PullPolicy,
 		Args:            []string{"taskmanager"},
 		Ports:           ports,
-		LivenessProbe:   &livenessProbe,
-		ReadinessProbe:  &readinessProbe,
+		LivenessProbe:   taskManagerSpec.LivenessProbe,
+		ReadinessProbe:  taskManagerSpec.ReadinessProbe,
 		Resources:       taskManagerSpec.Resources,
 		Env:             envVars,
 		EnvFrom:         flinkCluster.Spec.EnvFrom,
 		VolumeMounts:    volumeMounts,
+		Lifecycle: &corev1.Lifecycle{
+			PreStop: &corev1.Handler{
+				Exec: &corev1.ExecAction{
+					Command: []string{"sleep", strconv.Itoa(preStopSleepSeconds)},
+				},
+			},
+		},
 	}}
 	containers = append(containers, taskManagerSpec.Sidecars...)
 	var podSpec = corev1.PodSpec{
-		InitContainers:     convertTaskManagerInitContainers(&taskManagerSpec),
-		Containers:         containers,
-		Volumes:            volumes,
-		NodeSelector:       taskManagerSpec.NodeSelector,
-		Tolerations:        taskManagerSpec.Tolerations,
-		ImagePullSecrets:   imageSpec.PullSecrets,
-		SecurityContext:    securityContext,
-		ServiceAccountName: getServiceAccountName(serviceAccount),
+		InitContainers:                convertTaskManagerInitContainers(&taskManagerSpec, saMount, saEnv),
+		Containers:                    containers,
+		Volumes:                       volumes,
+		NodeSelector:                  taskManagerSpec.NodeSelector,
+		Tolerations:                   taskManagerSpec.Tolerations,
+		ImagePullSecrets:              imageSpec.PullSecrets,
+		SecurityContext:               securityContext,
+		ServiceAccountName:            getServiceAccountName(serviceAccount),
+		TerminationGracePeriodSeconds: &terminationGracePeriodSeconds,
 	}
+
 	var taskManagerStatefulSet = &appsv1.StatefulSet{
 		ObjectMeta: metav1.ObjectMeta{
 			Namespace: clusterNamespace,
@@ -536,13 +504,14 @@ func getDesiredTaskManagerStatefulSet(
 // Gets the desired configMap.
 func getDesiredConfigMap(
 	flinkCluster *v1beta1.FlinkCluster) *corev1.ConfigMap {
+	appVersion, _ := version.NewVersion(flinkCluster.Spec.FlinkVersion)
 
 	if shouldCleanup(flinkCluster, "ConfigMap") {
 		return nil
 	}
 
-	var clusterNamespace = flinkCluster.ObjectMeta.Namespace
-	var clusterName = flinkCluster.ObjectMeta.Name
+	var clusterNamespace = flinkCluster.Namespace
+	var clusterName = flinkCluster.Name
 	var flinkProperties = flinkCluster.Spec.FlinkProperties
 	var jmPorts = flinkCluster.Spec.JobManager.Ports
 	var tmPorts = flinkCluster.Spec.TaskManager.Ports
@@ -550,7 +519,6 @@ func getDesiredConfigMap(
 	var labels = mergeLabels(
 		getClusterLabels(*flinkCluster),
 		getRevisionHashLabels(&flinkCluster.Status.Revision))
-	var flinkHeapSize = calFlinkHeapSize(flinkCluster)
 	// Properties which should be provided from real deployed environment.
 	var flinkProps = map[string]string{
 		"jobmanager.rpc.address": getJobManagerServiceName(clusterName),
@@ -560,12 +528,29 @@ func getDesiredConfigMap(
 		"rest.port":              strconv.FormatInt(int64(*jmPorts.UI), 10),
 		"taskmanager.rpc.port":   strconv.FormatInt(int64(*tmPorts.RPC), 10),
 	}
-	if flinkHeapSize["jobmanager.heap.size"] != "" {
-		flinkProps["jobmanager.heap.size"] = flinkHeapSize["jobmanager.heap.size"]
+
+	if appVersion == nil || appVersion.LessThan(v10) {
+		var flinkHeapSize = calFlinkHeapSize(flinkCluster)
+		if flinkHeapSize["jobmanager.heap.size"] != "" {
+			flinkProps["jobmanager.heap.size"] = flinkHeapSize["jobmanager.heap.size"]
+		}
+		if flinkHeapSize["taskmanager.heap.size"] != "" {
+			flinkProps["taskmanager.heap.size"] = flinkHeapSize["taskmanager.heap.size"]
+		}
+	} else {
+		var flinkProcessMemorySize = calFlinkMemoryProcessSize(flinkCluster)
+		if flinkProcessMemorySize["jobmanager.memory.process.size"] != "" {
+			flinkProps["jobmanager.memory.process.size"] = flinkProcessMemorySize["jobmanager.memory.process.size"]
+		}
+		if flinkProcessMemorySize["taskmanager.memory.process.size"] != "" {
+			flinkProps["taskmanager.memory.process.size"] = flinkProcessMemorySize["taskmanager.memory.process.size"]
+		}
 	}
-	if flinkHeapSize["taskmanager.heap.size"] != "" {
-		flinkProps["taskmanager.heap.size"] = flinkHeapSize["taskmanager.heap.size"]
+
+	if taskSlots, err := calTaskManagerTaskSlots(flinkCluster); err == nil {
+		flinkProps["taskmanager.numberOfTaskSlots"] = strconv.Itoa(int(taskSlots))
 	}
+
 	// Add custom Flink properties.
 	for k, v := range flinkProperties {
 		// Do not allow to override properties from real deployment.
@@ -612,8 +597,8 @@ func getDesiredJob(observed *ObservedClusterState) *batchv1.Job {
 	var imageSpec = clusterSpec.Image
 	var serviceAccount = clusterSpec.ServiceAccountName
 	var jobManagerSpec = clusterSpec.JobManager
-	var clusterNamespace = flinkCluster.ObjectMeta.Namespace
-	var clusterName = flinkCluster.ObjectMeta.Name
+	var clusterNamespace = flinkCluster.Namespace
+	var clusterName = flinkCluster.Name
 	var jobName = getJobName(clusterName)
 	var jobManagerServiceName = clusterName + "-jobmanager"
 	var jobManagerAddress = fmt.Sprintf(
@@ -621,7 +606,7 @@ func getDesiredJob(observed *ObservedClusterState) *batchv1.Job {
 	var podLabels = getClusterLabels(*flinkCluster)
 	podLabels = mergeLabels(podLabels, jobManagerSpec.PodLabels)
 	var jobLabels = mergeLabels(podLabels, getRevisionHashLabels(&recorded.Revision))
-	var jobArgs = []string{"bash", "/opt/flink-operator/submit-job.sh"}
+	var jobArgs = []string{"bash", submitJobScriptPath}
 	jobArgs = append(jobArgs, "--jobmanager", jobManagerAddress)
 	if jobSpec.ClassName != nil {
 		jobArgs = append(jobArgs, "--class", *jobSpec.ClassName)
@@ -633,18 +618,26 @@ func getDesiredJob(observed *ObservedClusterState) *batchv1.Job {
 	}
 
 	if jobSpec.AllowNonRestoredState != nil &&
-		*jobSpec.AllowNonRestoredState == true {
+		*jobSpec.AllowNonRestoredState {
 		jobArgs = append(jobArgs, "--allowNonRestoredState")
 	}
-	if jobSpec.Parallelism != nil {
-		jobArgs = append(
-			jobArgs, "--parallelism", fmt.Sprint(*jobSpec.Parallelism))
+
+	if parallelism, err := calJobParallelism(flinkCluster); err == nil {
+		jobArgs = append(jobArgs, "--parallelism", fmt.Sprint(parallelism))
 	}
+
 	if jobSpec.NoLoggingToStdout != nil &&
-		*jobSpec.NoLoggingToStdout == true {
+		*jobSpec.NoLoggingToStdout {
 		jobArgs = append(jobArgs, "--sysoutLogging")
 	}
-	jobArgs = append(jobArgs, "--detached")
+
+	if jobSpec.Mode != nil {
+		switch *jobSpec.Mode {
+		case v1beta1.JobModeBlocking:
+		case v1beta1.JobModeDetached:
+			jobArgs = append(jobArgs, "--detached")
+		}
+	}
 
 	var securityContext = jobSpec.SecurityContext
 
@@ -656,7 +649,7 @@ func getDesiredJob(observed *ObservedClusterState) *batchv1.Job {
 	var jarPath = jobSpec.JarFile
 	if strings.Contains(jobSpec.JarFile, "://") {
 		var parts = strings.Split(jobSpec.JarFile, "/")
-		jarPath = "/opt/flink/job/" + parts[len(parts)-1]
+		jarPath = path.Join("/opt/flink/job", parts[len(parts)-1])
 		envVars = append(envVars, corev1.EnvVar{
 			Name:  "FLINK_JOB_JAR_URI",
 			Value: jobSpec.JarFile,
@@ -677,11 +670,9 @@ func getDesiredJob(observed *ObservedClusterState) *batchv1.Job {
 	volumeMounts = append(volumeMounts, jobSpec.VolumeMounts...)
 
 	// Submit job script config.
-	var sbsVolume *corev1.Volume
-	var sbsMount *corev1.VolumeMount
-	sbsVolume, sbsMount = convertSubmitJobScript(clusterName)
+	sbsVolume, sbsMount, confMount := convertSubmitJobScript(clusterName)
 	volumes = append(volumes, *sbsVolume)
-	volumeMounts = append(volumeMounts, *sbsMount)
+	volumeMounts = append(volumeMounts, *sbsMount, *confMount)
 
 	// Hadoop config.
 	var hcVolume, hcMount, hcEnv = convertHadoopConfig(clusterSpec.HadoopConfig)
@@ -710,9 +701,9 @@ func getDesiredJob(observed *ObservedClusterState) *batchv1.Job {
 	envVars = append(envVars, flinkCluster.Spec.EnvVars...)
 
 	var podSpec = corev1.PodSpec{
-		InitContainers: convertJobInitContainers(jobSpec),
+		InitContainers: convertJobInitContainers(jobSpec, saMount, saEnv),
 		Containers: []corev1.Container{
-			corev1.Container{
+			{
 				Name:            "main",
 				Image:           imageSpec.Name,
 				ImagePullPolicy: imageSpec.PullPolicy,
@@ -813,16 +804,33 @@ func ensureVolumeMountsInitContainer(initContainers []corev1.Container, volumeMo
 	return updatedInitContainers
 }
 
-func convertJobManagerInitContainers(jobManagerSpec *v1beta1.JobManagerSpec) []corev1.Container {
-	return ensureVolumeMountsInitContainer(jobManagerSpec.InitContainers, jobManagerSpec.VolumeMounts)
+func setGSAEnv(initContainers []corev1.Container, saMount *corev1.VolumeMount, saEnv *corev1.EnvVar) []corev1.Container {
+	updatedInitContainers := []corev1.Container{}
+	for _, initContainer := range initContainers {
+		if saEnv != nil {
+			initContainer.Env = append(initContainer.Env, *saEnv)
+		}
+		if saMount != nil {
+			initContainer.VolumeMounts = append(initContainer.VolumeMounts, *saMount)
+		}
+		updatedInitContainers = append(updatedInitContainers, initContainer)
+	}
+	return updatedInitContainers
 }
 
-func convertTaskManagerInitContainers(taskSpec *v1beta1.TaskManagerSpec) []corev1.Container {
-	return ensureVolumeMountsInitContainer(taskSpec.InitContainers, taskSpec.VolumeMounts)
+func convertJobManagerInitContainers(jobManagerSpec *v1beta1.JobManagerSpec, saMount *corev1.VolumeMount, saEnv *corev1.EnvVar) []corev1.Container {
+	updatedInitContainers := ensureVolumeMountsInitContainer(jobManagerSpec.InitContainers, jobManagerSpec.VolumeMounts)
+	return setGSAEnv(updatedInitContainers, saMount, saEnv)
 }
 
-func convertJobInitContainers(jobSpec *v1beta1.JobSpec) []corev1.Container {
-	return ensureVolumeMountsInitContainer(jobSpec.InitContainers, jobSpec.VolumeMounts)
+func convertTaskManagerInitContainers(taskSpec *v1beta1.TaskManagerSpec, saMount *corev1.VolumeMount, saEnv *corev1.EnvVar) []corev1.Container {
+	updatedInitContainers := ensureVolumeMountsInitContainer(taskSpec.InitContainers, taskSpec.VolumeMounts)
+	return setGSAEnv(updatedInitContainers, saMount, saEnv)
+}
+
+func convertJobInitContainers(jobSpec *v1beta1.JobSpec, saMount *corev1.VolumeMount, saEnv *corev1.EnvVar) []corev1.Container {
+	updatedInitContainers := ensureVolumeMountsInitContainer(jobSpec.InitContainers, jobSpec.VolumeMounts)
+	return setGSAEnv(updatedInitContainers, saMount, saEnv)
 }
 
 // Converts the FlinkCluster as owner reference for its child resources.
@@ -854,7 +862,7 @@ func getFlinkProperties(properties map[string]string) string {
 	return builder.String()
 }
 
-var jobManagerIngressHostRegex = regexp.MustCompile("{{\\s*[$]clusterName\\s*}}")
+var jobManagerIngressHostRegex = regexp.MustCompile(`{{\s*[$]clusterName\s*}}`)
 
 func getJobManagerIngressHost(ingressHostFormat string, clusterName string) string {
 	// TODO: Validating webhook should verify hostFormat
@@ -880,7 +888,7 @@ func shouldCleanup(
 	switch jobStatus.State {
 	case v1beta1.JobStateSucceeded:
 		action = cluster.Spec.Job.CleanupPolicy.AfterJobSucceeds
-	case v1beta1.JobStateFailed:
+	case v1beta1.JobStateFailed, v1beta1.JobStateLost:
 		action = cluster.Spec.Job.CleanupPolicy.AfterJobFails
 	case v1beta1.JobStateCancelled:
 		action = cluster.Spec.Job.CleanupPolicy.AfterJobCancelled
@@ -898,35 +906,62 @@ func shouldCleanup(
 	return false
 }
 
+func calJobParallelism(cluster *v1beta1.FlinkCluster) (int32, error) {
+	if cluster.Spec.Job.Parallelism != nil {
+		return *cluster.Spec.Job.Parallelism, nil
+	}
+
+	value, err := calTaskManagerTaskSlots(cluster)
+	if err != nil {
+		return 0, err
+	}
+
+	parallelism := cluster.Spec.TaskManager.Replicas * value
+	return parallelism, nil
+}
+
+func calTaskManagerTaskSlots(cluster *v1beta1.FlinkCluster) (int32, error) {
+	if ts, ok := cluster.Spec.FlinkProperties["taskmanager.numberOfTaskSlots"]; ok {
+		parsed, err := strconv.ParseInt(ts, 10, 32)
+		if err != nil {
+			return 0, err
+		}
+		return int32(parsed), nil
+	}
+
+	slots := int32(cluster.Spec.TaskManager.Resources.Limits.Cpu().Value()) / 2
+	if slots == 0 {
+		return 1, nil
+	}
+	return slots, nil
+}
+
 func calFlinkHeapSize(cluster *v1beta1.FlinkCluster) map[string]string {
-	if cluster.Spec.JobManager.MemoryOffHeapRatio == nil {
+	jm := cluster.Spec.JobManager
+	tm := cluster.Spec.TaskManager
+
+	if jm.MemoryOffHeapRatio == nil || tm.MemoryOffHeapRatio == nil {
 		return nil
 	}
+
 	var flinkHeapSize = make(map[string]string)
-	var jmMemoryLimitByte = cluster.Spec.JobManager.Resources.Limits.Memory().Value()
-	var tmMemLimitByte = cluster.Spec.TaskManager.Resources.Limits.Memory().Value()
-	if jmMemoryLimitByte > 0 {
-		jmMemoryOffHeapMinByte := cluster.Spec.JobManager.MemoryOffHeapMin.Value()
-		jmMemoryOffHeapRatio := int64(*cluster.Spec.JobManager.MemoryOffHeapRatio)
-		heapSizeMB := calHeapSize(
-			jmMemoryLimitByte,
-			jmMemoryOffHeapMinByte,
-			jmMemoryOffHeapRatio)
-		if heapSizeMB > 0 {
-			flinkHeapSize["jobmanager.heap.size"] = strconv.FormatInt(heapSizeMB, 10) + "m"
-		}
+
+	jmHeapSizeMB := calHeapSize(
+		jm.Resources.Limits.Memory().Value(),
+		jm.MemoryOffHeapMin.Value(),
+		int64(*jm.MemoryOffHeapRatio))
+	if jmHeapSizeMB > 0 {
+		flinkHeapSize["jobmanager.heap.size"] = strconv.FormatInt(jmHeapSizeMB, 10) + "m"
 	}
-	if tmMemLimitByte > 0 {
-		tmMemoryOffHeapMinByte := cluster.Spec.TaskManager.MemoryOffHeapMin.Value()
-		tmMemoryOffHeapRatio := int64(*cluster.Spec.TaskManager.MemoryOffHeapRatio)
-		heapSizeMB := calHeapSize(
-			tmMemLimitByte,
-			tmMemoryOffHeapMinByte,
-			tmMemoryOffHeapRatio)
-		if heapSizeMB > 0 {
-			flinkHeapSize["taskmanager.heap.size"] = strconv.FormatInt(heapSizeMB, 10) + "m"
-		}
+
+	tmHeapSizeMB := calHeapSize(
+		tm.Resources.Limits.Memory().Value(),
+		tm.MemoryOffHeapMin.Value(),
+		int64(*tm.MemoryOffHeapRatio))
+	if tmHeapSizeMB > 0 {
+		flinkHeapSize["taskmanager.heap.size"] = strconv.FormatInt(tmHeapSizeMB, 10) + "m"
 	}
+
 	return flinkHeapSize
 }
 
@@ -944,11 +979,41 @@ func calHeapSize(memSize int64, offHeapMin int64, offHeapRatio int64) int64 {
 	}
 	heapSizeCalculated := memSize - offHeapSize
 	if heapSizeCalculated > 0 {
-		divisor := resource.MustParse("1M")
+		divisor := resource.MustParse("1Mi")
 		heapSizeQuantity := resource.NewQuantity(heapSizeCalculated, resource.DecimalSI)
 		heapSizeMB = convertResourceMemoryToInt64(*heapSizeQuantity, divisor)
 	}
 	return heapSizeMB
+}
+
+func calProcessMemorySize(memSize, ratio int64) int64 {
+	size := int64(math.Ceil(float64((memSize * ratio)) / 100))
+	divisor := resource.MustParse("1Mi")
+	quantity := resource.NewQuantity(size, resource.DecimalSI)
+	return convertResourceMemoryToInt64(*quantity, divisor)
+}
+
+// Calculate process memory size in MB
+func calFlinkMemoryProcessSize(cluster *v1beta1.FlinkCluster) map[string]string {
+	var flinkProcessMemory = make(map[string]string)
+	jm := cluster.Spec.JobManager
+	tm := cluster.Spec.TaskManager
+
+	jmMemoryLimitByte := jm.Resources.Limits.Memory().Value()
+	jmRatio := int64(*jm.MemoryProcessRatio)
+	jmSizeMB := calProcessMemorySize(jmMemoryLimitByte, jmRatio)
+	if jmSizeMB > 0 {
+		flinkProcessMemory["jobmanager.memory.process.size"] = strconv.FormatInt(jmSizeMB, 10) + "m"
+	}
+
+	tmMemLimitByte := tm.Resources.Limits.Memory().Value()
+	ratio := int64(*tm.MemoryProcessRatio)
+	sizeMB := calProcessMemorySize(tmMemLimitByte, ratio)
+	if sizeMB > 0 {
+		flinkProcessMemory["taskmanager.memory.process.size"] = strconv.FormatInt(sizeMB, 10) + "m"
+	}
+
+	return flinkProcessMemory
 }
 
 func convertFlinkConfig(clusterName string) (*corev1.Volume, *corev1.VolumeMount) {
@@ -971,10 +1036,8 @@ func convertFlinkConfig(clusterName string) (*corev1.Volume, *corev1.VolumeMount
 	return confVol, confMount
 }
 
-func convertSubmitJobScript(clusterName string) (*corev1.Volume, *corev1.VolumeMount) {
-	var confVol *corev1.Volume
-	var confMount *corev1.VolumeMount
-	confVol = &corev1.Volume{
+func convertSubmitJobScript(clusterName string) (*corev1.Volume, *corev1.VolumeMount, *corev1.VolumeMount) {
+	confVol := &corev1.Volume{
 		Name: flinkConfigMapVolume,
 		VolumeSource: corev1.VolumeSource{
 			ConfigMap: &corev1.ConfigMapVolumeSource{
@@ -984,12 +1047,17 @@ func convertSubmitJobScript(clusterName string) (*corev1.Volume, *corev1.VolumeM
 			},
 		},
 	}
-	confMount = &corev1.VolumeMount{
+	scriptMount := &corev1.VolumeMount{
 		Name:      flinkConfigMapVolume,
-		MountPath: "/opt/flink-operator/submit-job.sh",
+		MountPath: submitJobScriptPath,
 		SubPath:   "submit-job.sh",
 	}
-	return confVol, confMount
+	confMount := &corev1.VolumeMount{
+		Name:      flinkConfigMapVolume,
+		MountPath: path.Join(flinkConfigMapPath, "flink-conf.yaml"),
+		SubPath:   "flink-conf.yaml",
+	}
+	return confVol, scriptMount, confMount
 }
 
 func convertHadoopConfig(hadoopConfig *v1beta1.HadoopConfig) (

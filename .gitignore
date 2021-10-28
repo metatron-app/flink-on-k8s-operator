@@ -25,7 +25,7 @@ bin
 *~
 
 # Dynamic files
-config/default/manager_image_patch.yaml
+config/test
 config/deploy
 ./helm-chart/.deploy
 .deploy

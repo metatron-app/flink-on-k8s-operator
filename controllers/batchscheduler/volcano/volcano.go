@@ -24,12 +24,12 @@ import (
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/tools/clientcmd"
-	scheduling "volcano.sh/volcano/pkg/apis/scheduling/v1beta1"
-	volcanoclient "volcano.sh/volcano/pkg/client/clientset/versioned"
+	scheduling "volcano.sh/apis/pkg/apis/scheduling/v1beta1"
+	volcanoclient "volcano.sh/apis/pkg/client/clientset/versioned"
 
-	"github.com/googlecloudplatform/flink-operator/api/v1beta1"
-	schedulerinterface "github.com/googlecloudplatform/flink-operator/controllers/batchscheduler/interface"
-	"github.com/googlecloudplatform/flink-operator/controllers/model"
+	"github.com/spotify/flink-on-k8s-operator/api/v1beta1"
+	schedulerinterface "github.com/spotify/flink-on-k8s-operator/controllers/batchscheduler/interface"
+	"github.com/spotify/flink-on-k8s-operator/controllers/model"
 )
 
 const (
@@ -111,8 +111,10 @@ func newOwnerReference(flinkCluster *v1beta1.FlinkCluster) metav1.OwnerReference
 
 func (v *VolcanoBatchScheduler) syncPodGroup(cluster *v1beta1.FlinkCluster, size int32, minResource corev1.ResourceList) error {
 	var err error
+	var pg *scheduling.PodGroup
+
 	podGroupName := v.getPodGroupName(cluster)
-	if pg, err := v.volcanoClient.SchedulingV1beta1().PodGroups(cluster.Namespace).Get(context.TODO(), podGroupName, metav1.GetOptions{}); err != nil {
+	if pg, err = v.volcanoClient.SchedulingV1beta1().PodGroups(cluster.Namespace).Get(context.TODO(), podGroupName, metav1.GetOptions{}); err != nil {
 		if !errors.IsNotFound(err) {
 			return err
 		}

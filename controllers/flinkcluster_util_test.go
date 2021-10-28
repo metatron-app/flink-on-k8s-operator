@@ -17,17 +17,19 @@ limitations under the License.
 package controllers
 
 import (
-	v1beta1 "github.com/googlecloudplatform/flink-operator/api/v1beta1"
-	"gotest.tools/assert"
+	"os"
+	"testing"
+
 	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
-	extensionsv1beta1 "k8s.io/api/extensions/v1beta1"
+	networkingv1 "k8s.io/api/networking/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
-	"os"
-	"testing"
+
+	v1beta1 "github.com/spotify/flink-on-k8s-operator/api/v1beta1"
+	"gotest.tools/assert"
 )
 
 func TestTimeConverter(t *testing.T) {
@@ -111,10 +113,10 @@ func TestNewRevision(t *testing.T) {
 	var revision, _ = newRevision(&flinkCluster, 1, &collisionCount)
 	var expectedRevision = appsv1.ControllerRevision{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      "mycluster-6d95c76b9c",
+			Name:      "mycluster-7bc87c954f",
 			Namespace: "default",
 			Labels: map[string]string{
-				"flinkoperator.k8s.io/hash":       "6d95c76b9c",
+				"flinkoperator.k8s.io/hash":       "7bc87c954f",
 				"flinkoperator.k8s.io/managed-by": "mycluster",
 			},
 			Annotations: map[string]string{},
@@ -297,7 +299,7 @@ func TestGetUpdateState(t *testing.T) {
 		jmStatefulSet:     &appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{RevisionNameLabel: "cluster-aa5e3a87z"}}},
 		tmStatefulSet:     &appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{RevisionNameLabel: "cluster-aa5e3a87z"}}},
 		jmService:         &corev1.Service{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{RevisionNameLabel: "cluster-aa5e3a87z"}}},
-		jmIngress:         &extensionsv1beta1.Ingress{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{RevisionNameLabel: "cluster-aa5e3a87z"}}},
+		jmIngress:         &networkingv1.Ingress{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{RevisionNameLabel: "cluster-aa5e3a87z"}}},
 	}
 	state = getUpdateState(&observed)
 	assert.Equal(t, state, UpdateStateFinished)
@@ -351,4 +353,39 @@ func TestGetNonLiveHistory(t *testing.T) {
 	historyLimit = 3
 	nonLiveHistory = getNonLiveHistory(revisions, historyLimit)
 	assert.Equal(t, len(nonLiveHistory), 0)
+}
+
+func TestGetFlinkJobSubmitLog(t *testing.T) {
+	var submit, expected *SubmitterLog
+
+	// success
+	log := `
+  /opt/flink/bin/flink run --jobmanager flinkjobcluster-sample-jobmanager:8081 --class org.apache.flink.streaming.examples.wordcount.WordCount --parallelism 2 --detached ./examples/streaming/WordCount.jar --input ./README.txt
+  Starting execution of program
+  Printing result to stdout. Use --output to specify output path.
+  Job has been submitted with JobID ec74209eb4e3db8ae72db00bd7a830aa
+  Program execution finished
+  Job with JobID ec74209eb4e3db8ae72db00bd7a830aa has finished.
+  Job Runtime: 333688 ms
+`
+	expected = &SubmitterLog{
+		jobID: "ec74209eb4e3db8ae72db00bd7a830aa",
+		message: `
+  /opt/flink/bin/flink run --jobmanager flinkjobcluster-sample-jobmanager:8081 --class org.apache.flink.streaming.examples.wordcount.WordCount --parallelism 2 --detached ./examples/streaming/WordCount.jar --input ./README.txt
+  Starting execution of program
+  Printing result to stdout. Use --output to specify output path.
+  Job has been submitted with JobID ec74209eb4e3db8ae72db00bd7a830aa
+  Program execution finished
+  Job with JobID ec74209eb4e3db8ae72db00bd7a830aa has finished.
+  Job Runtime: 333688 ms
+`,
+	}
+
+	submit = getFlinkJobSubmitLogFromString(log)
+	assert.Equal(t, submit.jobID, expected.jobID)
+	assert.Equal(t, submit.message, expected.message)
+
+	// job ID not found
+	submit = getFlinkJobSubmitLogFromString("")
+	assert.Equal(t, submit.jobID, "")
 }

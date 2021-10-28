@@ -19,53 +19,57 @@ package controllers
 import (
 	"context"
 	"fmt"
+	"strings"
+	"time"
+
 	"github.com/go-logr/logr"
-	v1beta1 "github.com/googlecloudplatform/flink-operator/api/v1beta1"
-	"github.com/googlecloudplatform/flink-operator/controllers/flinkclient"
-	"github.com/googlecloudplatform/flink-operator/controllers/history"
-	yaml "gopkg.in/yaml.v2"
+	v1beta1 "github.com/spotify/flink-on-k8s-operator/api/v1beta1"
+	"github.com/spotify/flink-on-k8s-operator/controllers/flink"
+	"github.com/spotify/flink-on-k8s-operator/controllers/history"
 	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
-	extensionsv1beta1 "k8s.io/api/extensions/v1beta1"
+	networkingv1 "k8s.io/api/networking/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/kubernetes"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"strings"
-	"time"
 )
 
 // ClusterStateObserver gets the observed state of the cluster.
 type ClusterStateObserver struct {
-	k8sClient   client.Client
-	flinkClient flinkclient.FlinkClient
-	request     ctrl.Request
-	context     context.Context
-	log         logr.Logger
-	history     history.Interface
+	k8sClient    client.Client
+	k8sClientset *kubernetes.Clientset
+	flinkClient  *flink.Client
+	request      ctrl.Request
+	context      context.Context
+	log          logr.Logger
+	history      history.Interface
 }
 
 // ObservedClusterState holds observed state of a cluster.
 type ObservedClusterState struct {
-	cluster           *v1beta1.FlinkCluster
-	revisions         []*appsv1.ControllerRevision
-	configMap         *corev1.ConfigMap
-	jmStatefulSet     *appsv1.StatefulSet
-	jmService         *corev1.Service
-	jmIngress         *extensionsv1beta1.Ingress
-	tmStatefulSet     *appsv1.StatefulSet
-	flinkJob          FlinkJob
-	flinkJobSubmitter FlinkJobSubmitter
-	savepoint         Savepoint
-	revision          Revision
-	observeTime       time.Time
-	updateState       UpdateState
+	cluster                *v1beta1.FlinkCluster
+	revisions              []*appsv1.ControllerRevision
+	configMap              *corev1.ConfigMap
+	jmStatefulSet          *appsv1.StatefulSet
+	jmService              *corev1.Service
+	jmIngress              *networkingv1.Ingress
+	tmStatefulSet          *appsv1.StatefulSet
+	persistentVolumeClaims *corev1.PersistentVolumeClaimList
+	flinkJob               FlinkJob
+	flinkJobSubmitter      FlinkJobSubmitter
+	savepoint              Savepoint
+	revision               Revision
+	observeTime            time.Time
+	updateState            UpdateState
 }
 
 type FlinkJob struct {
-	status     *flinkclient.JobStatus
-	list       *flinkclient.JobStatusList
+	status     *flink.Job
+	list       *flink.JobsOverview
+	exceptions *flink.JobExceptions
 	unexpected []string
 }
 
@@ -76,12 +80,12 @@ type FlinkJobSubmitter struct {
 }
 
 type SubmitterLog struct {
-	JobID   string `yaml:"jobID,omitempty"`
-	Message string `yaml:"message"`
+	jobID   string
+	message string
 }
 
 type Savepoint struct {
-	status *flinkclient.SavepointStatus
+	status *flink.SavepointStatus
 	error  error
 }
 
@@ -98,17 +102,20 @@ func (o *ObservedClusterState) isClusterUpdating() bool {
 // Job submitter status.
 func (s *FlinkJobSubmitter) getState() JobSubmitState {
 	switch {
-	case s.job == nil:
-		break
+	case s.log != nil && s.log.jobID != "":
+		return JobDeployStateSucceeded
+	// Job ID not found cases:
+	// Ongoing job submission.
 	case s.job.Status.Succeeded == 0 && s.job.Status.Failed == 0:
+		fallthrough
+	// Finished, but failed to extract log.
+	case s.log == nil:
 		return JobDeployStateInProgress
+	// Failed and job ID not found.
 	case s.job.Status.Failed > 0:
 		return JobDeployStateFailed
-	case s.job.Status.Succeeded > 0:
-		if s.log != nil && s.log.JobID != "" {
-			return JobDeployStateSucceeded
-		}
 	}
+	// Abnormal case: successfully finished but job ID not found.
 	return JobDeployStateUnknown
 }
 
@@ -198,7 +205,7 @@ func (observer *ClusterStateObserver) observe(
 	}
 
 	// (Optional) JobManager ingress.
-	var observedJmIngress = new(extensionsv1beta1.Ingress)
+	var observedJmIngress = new(networkingv1.Ingress)
 	err = observer.observeJobManagerIngress(observedJmIngress)
 	if err != nil {
 		if client.IgnoreNotFound(err) != nil {
@@ -237,6 +244,10 @@ func (observer *ClusterStateObserver) observe(
 	}
 	observed.savepoint = observedSavepoint
 
+	var pvcs = new(corev1.PersistentVolumeClaimList)
+	observer.observePersistentVolumeClaims(pvcs)
+	observed.persistentVolumeClaims = pvcs
+
 	// (Optional) job.
 	err = observer.observeJob(observed)
 	if err != nil {
@@ -262,7 +273,10 @@ func (observer *ClusterStateObserver) observeJob(
 
 	// Observe the Flink job submitter.
 	var submitter FlinkJobSubmitter
-	err = observer.observeSubmitter(&submitter)
+
+	// Extract the log stream from pod only when the job state is Deploying.
+	var recordedJob = recorded.Components.Job
+	err = observer.observeSubmitter(recordedJob, &submitter)
 	if err != nil {
 		log.Error(err, "Failed to get the status of the job submitter")
 	}
@@ -271,8 +285,8 @@ func (observer *ClusterStateObserver) observeJob(
 	// Observe the Flink job status.
 	var flinkJobID string
 	// Get the ID from the job submitter.
-	if submitter.log != nil && submitter.log.JobID != "" {
-		flinkJobID = submitter.log.JobID
+	if submitter.log != nil && submitter.log.jobID != "" {
+		flinkJobID = submitter.log.jobID
 	} else
 	// Or get the job ID from the recorded job status which is written in previous iteration.
 	if recorded.Components.Job != nil {
@@ -285,7 +299,7 @@ func (observer *ClusterStateObserver) observeJob(
 	return nil
 }
 
-func (observer *ClusterStateObserver) observeSubmitter(submitter *FlinkJobSubmitter) error {
+func (observer *ClusterStateObserver) observeSubmitter(recordedJob *v1beta1.JobStatus, submitter *FlinkJobSubmitter) error {
 	var log = observer.log
 	var err error
 
@@ -296,13 +310,13 @@ func (observer *ClusterStateObserver) observeSubmitter(submitter *FlinkJobSubmit
 
 	// Job resource.
 	job = new(batchv1.Job)
-	err = observer.observeSubmitterJob(job)
+	err = observer.observeJobSubmitter(job)
 	if err != nil {
 		if client.IgnoreNotFound(err) != nil {
-			log.Error(err, "Failed to get the submitter job")
+			log.Error(err, "Failed to get the job submitter")
 			return err
 		}
-		log.Info("Observed submitter job", "state", "nil")
+		log.Info("Observed job submitter", "state", "nil")
 		job = nil
 	} else {
 		log.Info("Observed submitter job", "state", *job)
@@ -329,21 +343,26 @@ func (observer *ClusterStateObserver) observeSubmitter(submitter *FlinkJobSubmit
 	}
 	submitter.pod = pod
 
-	// Extract submission result.
-	var jobSubmissionCompleted = job.Status.Succeeded > 0 || job.Status.Failed > 0
-	if !jobSubmissionCompleted {
+	// Extract submission result only when it is in deployment progress.
+	// It is not necessary to get the log stream from the submitter pod always.
+	var jobDeployInProgress = recordedJob != nil && recordedJob.State == v1beta1.JobStateDeploying
+	if !jobDeployInProgress {
 		return nil
 	}
 	log.Info("Extracting the result of job submission because it is completed")
-	podLog = new(SubmitterLog)
-	err = observer.observeFlinkJobSubmitterLog(pod, podLog)
+	podLog, err = getFlinkJobSubmitLog(observer.k8sClientset, pod)
 	if err != nil {
-		log.Error(err, "Failed to extract the job submission result")
-		podLog = nil
-	} else if podLog == nil {
-		log.Info("Observed submitter log", "state", "nil")
+		// Error occurred while pulling log stream from the job submitter pod.
+		// In this case the operator must return the error and retry in the next reconciliation iteration.
+		log.Error(err, "Failed to get log stream from the job submitter pod. Will try again in the next iteration.")
+		return err
 	} else {
-		log.Info("Observed submitter log", "state", *podLog)
+		log.Info("Observed job submitter log", "submitter log", podLog.message)
+		if podLog.jobID != "" {
+			log.Info("Observed job submitter: Flink job ID found", "job ID", podLog.jobID)
+		} else {
+			log.Info("Observed job submitter: Flink job ID not found yet")
+		}
 	}
 	submitter.log = podLog
 
@@ -355,30 +374,24 @@ func (observer *ClusterStateObserver) observeSubmitter(submitter *FlinkJobSubmit
 //
 // This needs to be done after the job manager is ready, because we use it to detect whether the Flink API server is up
 // and running.
-func (observer *ClusterStateObserver) observeFlinkJobStatus(
-	observed *ObservedClusterState,
-	flinkJobID string,
-	flinkJob *FlinkJob) {
+func (observer *ClusterStateObserver) observeFlinkJobStatus(observed *ObservedClusterState, flinkJobID string, flinkJob *FlinkJob) {
 	var log = observer.log
 
 	// Observe following
-	var flinkJobStatus *flinkclient.JobStatus
-	var flinkJobList *flinkclient.JobStatusList
+	var flinkJobStatus *flink.Job
+	var flinkJobList *flink.JobsOverview
 	var flinkJobsUnexpected []string
 
 	// Wait until the job manager is ready.
-	var jmReady = observed.jmStatefulSet != nil && getStatefulSetState(observed.jmStatefulSet) == v1beta1.ComponentStateReady
+	jmReady := observed.jmStatefulSet != nil && getStatefulSetState(observed.jmStatefulSet) == v1beta1.ComponentStateReady
 	if !jmReady {
-		log.Info(
-			"Skip getting Flink job status.",
-			"job manager ready", jmReady)
+		log.Info("Skip getting Flink job status; JobManager is not ready")
 		return
 	}
 
 	// Get Flink job status list.
-	flinkJobList = &flinkclient.JobStatusList{}
-	var flinkAPIBaseURL = getFlinkAPIBaseURL(observed.cluster)
-	var err = observer.flinkClient.GetJobStatusList(flinkAPIBaseURL, flinkJobList)
+	flinkAPIBaseURL := getFlinkAPIBaseURL(observed.cluster)
+	flinkJobList, err := observer.flinkClient.GetJobsOverview(flinkAPIBaseURL)
 	if err != nil {
 		// It is normal in many cases, not an error.
 		log.Info("Failed to get Flink job status list.", "error", err)
@@ -388,12 +401,22 @@ func (observer *ClusterStateObserver) observeFlinkJobStatus(
 
 	// Extract the current job status and unexpected jobs.
 	for _, job := range flinkJobList.Jobs {
-		if flinkJobID == job.ID {
+		if flinkJobID == job.Id {
 			flinkJobStatus = &job
-		} else if getFlinkJobDeploymentState(job.Status) == v1beta1.JobStateRunning {
-			flinkJobsUnexpected = append(flinkJobsUnexpected, job.ID)
+		} else if getFlinkJobDeploymentState(job.State) == v1beta1.JobStateRunning {
+			flinkJobsUnexpected = append(flinkJobsUnexpected, job.Id)
 		}
 	}
+
+	flinkJobExceptions, err := observer.flinkClient.GetJobExceptions(flinkAPIBaseURL, flinkJobID)
+	if err != nil {
+		// It is normal in many cases, not an error.
+		log.Info("Failed to get Flink job exceptions.", "error", err)
+		return
+	}
+	log.Info("Observed Flink job exceptions", "jobs", flinkJobExceptions)
+	flinkJob.exceptions = flinkJobExceptions
+
 	flinkJob.status = flinkJobStatus
 	flinkJob.unexpected = flinkJobsUnexpected
 	log.Info("Observed Flink job",
@@ -403,8 +426,6 @@ func (observer *ClusterStateObserver) observeFlinkJobStatus(
 	if len(flinkJobsUnexpected) > 0 {
 		log.Info("More than one unexpected Flink job were found!")
 	}
-
-	return
 }
 
 func (observer *ClusterStateObserver) observeSavepoint(cluster *v1beta1.FlinkCluster, savepoint *Savepoint) error {
@@ -421,7 +442,7 @@ func (observer *ClusterStateObserver) observeSavepoint(cluster *v1beta1.FlinkClu
 	var triggerID = recordedSavepoint.TriggerID
 
 	savepointStatus, err := observer.flinkClient.GetSavepointStatus(flinkAPIBaseURL, jobID, triggerID)
-	savepoint.status = &savepointStatus
+	savepoint.status = savepointStatus
 	savepoint.error = err
 
 	return err
@@ -516,7 +537,7 @@ func (observer *ClusterStateObserver) observeJobManagerService(
 }
 
 func (observer *ClusterStateObserver) observeJobManagerIngress(
-	observedIngress *extensionsv1beta1.Ingress) error {
+	observedIngress *networkingv1.Ingress) error {
 	var clusterNamespace = observer.request.Namespace
 	var clusterName = observer.request.Name
 
@@ -529,7 +550,7 @@ func (observer *ClusterStateObserver) observeJobManagerIngress(
 		observedIngress)
 }
 
-func (observer *ClusterStateObserver) observeSubmitterJob(
+func (observer *ClusterStateObserver) observeJobSubmitter(
 	observedJob *batchv1.Job) error {
 	var clusterNamespace = observer.request.Namespace
 	var clusterName = observer.request.Name
@@ -563,6 +584,31 @@ func (observer *ClusterStateObserver) observeJobSubmitterPod(
 		observedPod = nil
 	} else {
 		podList.Items[0].DeepCopyInto(observedPod)
+	}
+
+	return nil
+}
+
+func (observer *ClusterStateObserver) observePersistentVolumeClaims(
+	observedClaims *corev1.PersistentVolumeClaimList) error {
+	var log = observer.log
+	var clusterNamespace = observer.request.Namespace
+	var clusterName = observer.request.Name
+	var selector = labels.SelectorFromSet(map[string]string{"cluster": clusterName})
+
+	var err = observer.k8sClient.List(
+		observer.context,
+		observedClaims,
+		client.InNamespace(clusterNamespace),
+		client.MatchingLabelsSelector{Selector: selector})
+	if err != nil {
+		if client.IgnoreNotFound(err) != nil {
+			log.Error(err, "Failed to get persistent volume claim list")
+			return err
+		}
+		log.Info("Observed persistent volume claim list", "state", "nil")
+	} else {
+		log.Info("Observed persistent volume claim list", "state", *observedClaims)
 	}
 
 	return nil
@@ -679,26 +725,4 @@ func (observer *ClusterStateObserver) truncateHistory(observed *ObservedClusterS
 		}
 	}
 	return nil
-}
-
-// observeFlinkJobSubmit extract submit result from the pod termination log.
-func (observer *ClusterStateObserver) observeFlinkJobSubmitterLog(observedPod *corev1.Pod, submitterLog *SubmitterLog) error {
-	var log = observer.log
-	var containerStatuses = observedPod.Status.ContainerStatuses
-	if len(containerStatuses) == 0 ||
-		containerStatuses[0].State.Terminated == nil ||
-		containerStatuses[0].State.Terminated.Message == "" {
-		submitterLog = nil
-		log.Info("job pod found, but no termination log")
-		return nil
-	}
-
-	// The job submission script writes the submission log to the pod termination log at the end of execution.
-	// If the job submission is successful, the extracted job ID is also included.
-	// The job submit script writes the submission result in YAML format,
-	// so parse it here to get the ID - if available - and log.
-	// Note: https://kubernetes.io/docs/tasks/debug-application-cluster/determine-reason-pod-failure/
-	var rawJobSubmissionResult = containerStatuses[0].State.Terminated.Message
-	var err = yaml.Unmarshal([]byte(rawJobSubmissionResult), submitterLog)
-	return err
 }

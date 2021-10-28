@@ -18,17 +18,19 @@ package controllers
 
 import (
 	"context"
-	"github.com/googlecloudplatform/flink-operator/controllers/history"
 	"time"
 
+	"github.com/spotify/flink-on-k8s-operator/controllers/flink"
+	"github.com/spotify/flink-on-k8s-operator/controllers/history"
+
 	"github.com/go-logr/logr"
-	v1beta1 "github.com/googlecloudplatform/flink-operator/api/v1beta1"
-	"github.com/googlecloudplatform/flink-operator/controllers/flinkclient"
-	"github.com/googlecloudplatform/flink-operator/controllers/model"
+	v1beta1 "github.com/spotify/flink-on-k8s-operator/api/v1beta1"
+	"github.com/spotify/flink-on-k8s-operator/controllers/model"
 
 	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -39,9 +41,10 @@ var controllerKind = v1beta1.GroupVersion.WithKind("FlinkCluster")
 
 // FlinkClusterReconciler reconciles a FlinkCluster object
 type FlinkClusterReconciler struct {
-	Client client.Client
-	Log    logr.Logger
-	Mgr    ctrl.Manager
+	Client    client.Client
+	Clientset *kubernetes.Clientset
+	Log       logr.Logger
+	Mgr       ctrl.Manager
 }
 
 // +kubebuilder:rbac:groups=flinkoperator.k8s.io,resources=flinkclusters,verbs=get;list;watch;create;update;patch;delete
@@ -50,6 +53,7 @@ type FlinkClusterReconciler struct {
 // +kubebuilder:rbac:groups=apps,resources=deployments/status,verbs=get
 // +kubebuilder:rbac:groups=apps,resources=statefulsets,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=apps,resources=statefulsets/status,verbs=get
+// +kubebuilder:rbac:groups=core,resources=persistentvolumeclaims,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=core,resources=pods,verbs=get;list;watch
 // +kubebuilder:rbac:groups=core,resources=pods/status,verbs=get
 // +kubebuilder:rbac:groups=core,resources=services,verbs=get;list;watch;create;update;patch;delete
@@ -59,27 +63,25 @@ type FlinkClusterReconciler struct {
 // +kubebuilder:rbac:groups=core,resources=configmaps,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=batch,resources=jobs,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=batch,resources=jobs/status,verbs=get
-// +kubebuilder:rbac:groups=extensions,resources=ingresses,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=extensions,resources=ingresses/status,verbs=get
+// +kubebuilder:rbac:groups=networking,resources=ingresses,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=networking,resources=ingresses/status,verbs=get
 
 // Reconcile the observed state towards the desired state for a FlinkCluster custom resource.
-func (reconciler *FlinkClusterReconciler) Reconcile(
+func (reconciler *FlinkClusterReconciler) Reconcile(ctx context.Context,
 	request ctrl.Request) (ctrl.Result, error) {
 	var log = reconciler.Log.WithValues(
 		"cluster", request.NamespacedName)
 	var handler = FlinkClusterHandler{
-		k8sClient: reconciler.Client,
-		flinkClient: flinkclient.FlinkClient{
-			Log:        log,
-			HTTPClient: flinkclient.HTTPClient{Log: log},
-		},
-		request:  request,
-		context:  context.Background(),
-		log:      log,
-		recorder: reconciler.Mgr.GetEventRecorderFor("FlinkOperator"),
-		observed: ObservedClusterState{},
+		k8sClient:    reconciler.Client,
+		k8sClientset: reconciler.Clientset,
+		flinkClient:  flink.NewDefaultClient(log),
+		request:      request,
+		context:      context.Background(),
+		log:          log,
+		recorder:     reconciler.Mgr.GetEventRecorderFor("FlinkOperator"),
+		observed:     ObservedClusterState{},
 	}
-	return handler.reconcile(request)
+	return handler.reconcile(ctx, request)
 }
 
 // SetupWithManager registers this reconciler with the controller manager and
@@ -100,7 +102,8 @@ func (reconciler *FlinkClusterReconciler) SetupWithManager(
 // reconcile request.
 type FlinkClusterHandler struct {
 	k8sClient         client.Client
-	flinkClient       flinkclient.FlinkClient
+	k8sClientset      *kubernetes.Clientset
+	flinkClient       *flink.Client
 	request           ctrl.Request
 	context           context.Context
 	log               logr.Logger
@@ -110,7 +113,7 @@ type FlinkClusterHandler struct {
 	desired           model.DesiredClusterState
 }
 
-func (handler *FlinkClusterHandler) reconcile(
+func (handler *FlinkClusterHandler) reconcile(ctx context.Context,
 	request ctrl.Request) (ctrl.Result, error) {
 	var k8sClient = handler.k8sClient
 	var flinkClient = handler.flinkClient
@@ -128,12 +131,13 @@ func (handler *FlinkClusterHandler) reconcile(
 	log.Info("---------- 1. Observe the current state ----------")
 
 	var observer = ClusterStateObserver{
-		k8sClient:   k8sClient,
-		flinkClient: flinkClient,
-		request:     request,
-		context:     context,
-		log:         log,
-		history:     history,
+		k8sClient:    k8sClient,
+		k8sClientset: handler.k8sClientset,
+		flinkClient:  flinkClient,
+		request:      request,
+		context:      context,
+		log:          log,
+		history:      history,
 	}
 	err = observer.observe(observed)
 	if err != nil {

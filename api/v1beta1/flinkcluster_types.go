@@ -41,6 +41,14 @@ const (
 	ComponentStateDeleted  = "Deleted"
 )
 
+// JobMode defines the running mode for the job.
+const (
+	JobModeBlocking = "Blocking"
+	JobModeDetached = "Detached"
+)
+
+type JobMode string
+
 // JobState defines states for a Flink job deployment.
 const (
 	JobStatePending      = "Pending"
@@ -94,16 +102,18 @@ const (
 )
 
 // Savepoint status
+type SavepointReason string
+
 const (
 	SavepointStateInProgress    = "InProgress"
 	SavepointStateTriggerFailed = "TriggerFailed"
 	SavepointStateFailed        = "Failed"
 	SavepointStateSucceeded     = "Succeeded"
 
-	SavepointTriggerReasonUserRequested = "user requested"
-	SavepointTriggerReasonJobCancel     = "job cancel"
-	SavepointTriggerReasonScheduled     = "scheduled"
-	SavepointTriggerReasonUpdate        = "update"
+	SavepointReasonUserRequested SavepointReason = "user requested"
+	SavepointReasonJobCancel     SavepointReason = "job cancel"
+	SavepointReasonScheduled     SavepointReason = "scheduled"
+	SavepointReasonUpdate        SavepointReason = "update"
 )
 
 // ImageSpec defines Flink image of JobManager and TaskManager containers.
@@ -191,8 +201,6 @@ type JobManagerSpec struct {
 	// More info: https://kubernetes.io/docs/concepts/configuration/manage-compute-resources-container/
 	Resources corev1.ResourceRequirements `json:"resources,omitempty"`
 
-	// TODO: Memory calculation would be change. Let's watch the issue FLINK-13980.
-
 	// Percentage of off-heap memory in containers, as a safety margin to avoid OOM kill, default: 25
 	MemoryOffHeapRatio *int32 `json:"memoryOffHeapRatio,omitempty"`
 
@@ -200,6 +208,9 @@ type JobManagerSpec struct {
 	// You can express this value like 600M, 572Mi and 600e6
 	// More info: https://kubernetes.io/docs/concepts/configuration/manage-compute-resources-container/#meaning-of-memory
 	MemoryOffHeapMin resource.Quantity `json:"memoryOffHeapMin,omitempty"`
+
+	// For Flink 1.10+. Percentage of memory process, as a safety margin to avoid OOM kill, default: 80
+	MemoryProcessRatio *int32 `json:"memoryProcessRatio,omitempty"`
 
 	// Volumes in the JobManager pod.
 	Volumes []corev1.Volume `json:"volumes,omitempty"`
@@ -233,6 +244,14 @@ type JobManagerSpec struct {
 
 	// JobManager StatefulSet pod template labels.
 	PodLabels map[string]string `json:"podLabels,omitempty"`
+
+	// Container liveness probe
+	// If omitted, a default value will be used.
+	LivenessProbe *corev1.Probe `json:"livenessProbe,omitempty"`
+
+	// Container readiness probe
+	// If omitted, a default value will be used.
+	ReadinessProbe *corev1.Probe `json:"readinessProbe,omitempty"`
 }
 
 // TaskManagerPorts defines ports of TaskManager.
@@ -274,6 +293,9 @@ type TaskManagerSpec struct {
 	// More info: https://kubernetes.io/docs/concepts/configuration/manage-compute-resources-container/#meaning-of-memory
 	MemoryOffHeapMin resource.Quantity `json:"memoryOffHeapMin,omitempty"`
 
+	// For Flink 1.10+. Percentage of process memory, as a safety margin to avoid OOM kill, default: 20
+	MemoryProcessRatio *int32 `json:"memoryProcessRatio,omitempty"`
+
 	// Volumes in the TaskManager pods.
 	// More info: https://kubernetes.io/docs/concepts/storage/volumes/
 	Volumes []corev1.Volume `json:"volumes,omitempty"`
@@ -308,6 +330,14 @@ type TaskManagerSpec struct {
 
 	// TaskManager StatefulSet pod template labels.
 	PodLabels map[string]string `json:"podLabels,omitempty"`
+
+	// Container liveness probe
+	// If omitted, a default value will be used.
+	LivenessProbe *corev1.Probe `json:"livenessProbe,omitempty"`
+
+	// Container readiness probe
+	// If omitted, a default value will be used.
+	ReadinessProbe *corev1.Probe `json:"readinessProbe,omitempty"`
 }
 
 // CleanupAction defines the action to take after job finishes.
@@ -423,10 +453,16 @@ type JobSpec struct {
 	Resources corev1.ResourceRequirements `json:"resources,omitempty"`
 
 	SecurityContext *corev1.PodSecurityContext `json:"securityContext,omitempty"`
+
+	// Job running mode
+	Mode *JobMode `json:"mode,omitempty"`
 }
 
 // FlinkClusterSpec defines the desired state of FlinkCluster
 type FlinkClusterSpec struct {
+	// The version of Flink to be managed. This version must match the version in the image.
+	FlinkVersion string `json:"flinkVersion"`
+
 	// Flink image spec for the cluster's components.
 	Image ImageSpec `json:"image"`
 
@@ -558,11 +594,14 @@ type FlinkClusterControlStatus struct {
 
 // JobStatus defines the status of a job.
 type JobStatus struct {
-	// The name of the Kubernetes job resource.
-	Name string `json:"name,omitempty"`
-
 	// The ID of the Flink job.
 	ID string `json:"id,omitempty"`
+
+	// The Name of the Flink job.
+	Name string `json:"name,omitempty"`
+
+	// The name of the Kubernetes job resource.
+	SubmitterName string `json:"submitterName,omitempty"`
 
 	// The state of the Flink job deployment.
 	State string `json:"state"`
@@ -592,11 +631,14 @@ type JobStatus struct {
 	// The Flink job started timestamp.
 	StartTime string `json:"startTime,omitempty"`
 
-	// The Flink job ended timestamp.
-	EndTime string `json:"endTime,omitempty"`
-
 	// The number of restarts.
 	RestartCount int32 `json:"restartCount,omitempty"`
+
+	// Job completion time. Present when job is terminated regardless of its state.
+	CompletionTime *metav1.Time `json:"completionTime,omitempty"`
+
+	// Reasons for the job failure. Present if job state is Failure
+	FailureReasons []string `json:"failureReasons,omitempty"`
 }
 
 // SavepointStatus is the status of savepoint progress.
@@ -611,7 +653,7 @@ type SavepointStatus struct {
 	TriggerTime string `json:"triggerTime,omitempty"`
 
 	// Savepoint triggered reason.
-	TriggerReason string `json:"triggerReason,omitempty"`
+	TriggerReason SavepointReason `json:"triggerReason,omitempty"`
 
 	// Savepoint status update time.
 	UpdateTime string `json:"requestTime,omitempty"`
@@ -666,6 +708,9 @@ type JobManagerServiceStatus struct {
 
 	// (Optional) The node port, present when `accessScope` is `NodePort`.
 	NodePort int32 `json:"nodePort,omitempty"`
+
+	// (Optional) The load balancer ingress, present when `accessScope` is `VPC` or `External`
+	LoadBalancerIngress []corev1.LoadBalancerIngress `json:"loadBalancerIngress,omitempty"`
 }
 
 // FlinkClusterStatus defines the observed state of FlinkCluster
@@ -694,6 +739,10 @@ type FlinkClusterStatus struct {
 
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
+// +kubebuilder:resource:shortName="fc"
+// +kubebuilder:printcolumn:name="version",type=string,JSONPath=`.spec.flinkVersion`
+// +kubebuilder:printcolumn:name="status",type=string,JSONPath=`.status.state`
+// +kubebuilder:printcolumn:name="age",type=date,JSONPath=`.metadata.creationTimestamp`
 
 // FlinkCluster is the Schema for the flinkclusters API
 type FlinkCluster struct {
@@ -705,6 +754,7 @@ type FlinkCluster struct {
 }
 
 // +kubebuilder:object:root=true
+// +kubebuilder:resource:shortName="fc"
 
 // FlinkClusterList contains a list of FlinkCluster
 type FlinkClusterList struct {

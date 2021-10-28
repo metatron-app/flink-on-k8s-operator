@@ -18,22 +18,28 @@ package controllers
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
-	"github.com/googlecloudplatform/flink-operator/api/v1beta1"
-	"github.com/googlecloudplatform/flink-operator/controllers/flinkclient"
-	"github.com/googlecloudplatform/flink-operator/controllers/history"
-	appsv1 "k8s.io/api/apps/v1"
-	batchv1 "k8s.io/api/batch/v1"
-	corev1 "k8s.io/api/core/v1"
-	extensionsv1beta1 "k8s.io/api/extensions/v1beta1"
-	"k8s.io/apimachinery/pkg/api/meta"
-	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
-	"k8s.io/apimachinery/pkg/runtime"
+	"io"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/spotify/flink-on-k8s-operator/controllers/flink"
+
+	v1beta1 "github.com/spotify/flink-on-k8s-operator/api/v1beta1"
+	"github.com/spotify/flink-on-k8s-operator/controllers/history"
+	appsv1 "k8s.io/api/apps/v1"
+	batchv1 "k8s.io/api/batch/v1"
+	corev1 "k8s.io/api/core/v1"
+	networkingv1 "k8s.io/api/networking/v1"
+	"k8s.io/apimachinery/pkg/api/meta"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/kubernetes"
 )
 
 const (
@@ -43,6 +49,10 @@ const (
 	RevisionNameLabel = "flinkoperator.k8s.io/revision-name"
 
 	SavepointRetryIntervalSeconds = 10
+)
+
+var (
+	jobIdRegexp = regexp.MustCompile("JobID (.*)\n")
 )
 
 type UpdateState string
@@ -76,8 +86,8 @@ func getFlinkAPIBaseURL(cluster *v1beta1.FlinkCluster) string {
 
 	return fmt.Sprintf(
 		"http://%s.%s.svc.%s:%d",
-		getJobManagerServiceName(cluster.ObjectMeta.Name),
-		cluster.ObjectMeta.Namespace,
+		getJobManagerServiceName(cluster.Name),
+		cluster.Namespace,
 		clusterDomain,
 		*cluster.Spec.JobManager.Ports.UI)
 }
@@ -194,18 +204,18 @@ func newRevision(cluster *v1beta1.FlinkCluster, revision int64, collisionCount *
 	}
 	cr, err := history.NewControllerRevision(cluster,
 		controllerKind,
-		cluster.ObjectMeta.Labels,
+		cluster.Labels,
 		runtime.RawExtension{Raw: patch},
 		revision,
 		collisionCount)
 	if err != nil {
 		return nil, err
 	}
-	if cr.ObjectMeta.Annotations == nil {
-		cr.ObjectMeta.Annotations = make(map[string]string)
+	if cr.Annotations == nil {
+		cr.Annotations = make(map[string]string)
 	}
 	for key, value := range cluster.Annotations {
-		cr.ObjectMeta.Annotations[key] = value
+		cr.Annotations[key] = value
 	}
 	cr.SetNamespace(cluster.GetNamespace())
 	cr.GetLabels()[history.ControllerRevisionManagedByLabel] = cluster.GetName()
@@ -315,7 +325,7 @@ func getSavepointEvent(status v1beta1.SavepointStatus) (eventType string, eventR
 		msg = msg[:100] + "..."
 	}
 	var triggerReason = status.TriggerReason
-	if triggerReason == v1beta1.SavepointTriggerReasonJobCancel || triggerReason == v1beta1.SavepointTriggerReasonUpdate {
+	if triggerReason == v1beta1.SavepointReasonJobCancel || triggerReason == v1beta1.SavepointReasonUpdate {
 		triggerReason = "for " + triggerReason
 	}
 	switch status.State {
@@ -330,7 +340,7 @@ func getSavepointEvent(status v1beta1.SavepointStatus) (eventType string, eventR
 	case v1beta1.SavepointStateSucceeded:
 		eventType = corev1.EventTypeNormal
 		eventReason = "SavepointCreated"
-		eventMessage = fmt.Sprintf("Successfully savepoint created")
+		eventMessage = "Successfully savepoint created"
 	case v1beta1.SavepointStateFailed:
 		eventType = corev1.EventTypeWarning
 		eventReason = "SavepointFailed"
@@ -349,10 +359,7 @@ func hasTimeElapsed(timeToCheckStr string, now time.Time, intervalSec int) bool 
 	tc := &TimeConverter{}
 	timeToCheck := tc.FromString(timeToCheckStr)
 	intervalPassedTime := timeToCheck.Add(time.Duration(int64(intervalSec) * int64(time.Second)))
-	if now.After(intervalPassedTime) {
-		return true
-	}
-	return false
+	return now.After(intervalPassedTime)
 }
 
 // isComponentUpdated checks whether the component updated.
@@ -382,17 +389,11 @@ func isComponentUpdated(component runtime.Object, cluster *v1beta1.FlinkCluster)
 		}
 	case *batchv1.Job:
 		if o == nil {
-			if cluster.Spec.Job != nil {
-				return false
-			}
-			return true
+			return cluster.Spec.Job == nil
 		}
-	case *extensionsv1beta1.Ingress:
+	case *networkingv1.Ingress:
 		if o == nil {
-			if cluster.Spec.JobManager.Ingress != nil {
-				return false
-			}
-			return true
+			return cluster.Spec.JobManager.Ingress == nil
 		}
 	}
 
@@ -440,7 +441,7 @@ func isClusterUpdateToDate(observed *ObservedClusterState) bool {
 }
 
 // isFlinkAPIReady checks whether cluster is ready to submit job.
-func isFlinkAPIReady(list *flinkclient.JobStatusList) bool {
+func isFlinkAPIReady(list *flink.JobsOverview) bool {
 	// If the observed Flink job status list is not nil (e.g., emtpy list),
 	// it means Flink REST API server is up and running. It is the source of
 	// truth of whether we can submit a job.
@@ -450,8 +451,8 @@ func isFlinkAPIReady(list *flinkclient.JobStatusList) bool {
 // jobStateFinalized returns true, if job state is saved so that it can be resumed later.
 func finalSavepointRequested(jobID string, s *v1beta1.SavepointStatus) bool {
 	return s != nil && s.JobID == jobID &&
-		(s.TriggerReason == v1beta1.SavepointTriggerReasonUpdate ||
-			s.TriggerReason == v1beta1.SavepointTriggerReasonJobCancel)
+		(s.TriggerReason == v1beta1.SavepointReasonUpdate ||
+			s.TriggerReason == v1beta1.SavepointReasonJobCancel)
 }
 
 func getUpdateState(observed *ObservedClusterState) UpdateState {
@@ -467,7 +468,7 @@ func getUpdateState(observed *ObservedClusterState) UpdateState {
 		return ""
 	}
 	switch {
-	case !job.UpdateReady(jobSpec, observed.observeTime):
+	case jobSpec != nil && !job.UpdateReady(jobSpec, observed.observeTime):
 		return UpdateStatePreparing
 	case !isClusterUpdateToDate(observed):
 		return UpdateStateInProgress
@@ -510,5 +511,46 @@ func getFlinkJobDeploymentState(flinkJobState string) string {
 		return v1beta1.JobStateFailed
 	default:
 		return ""
+	}
+}
+
+func getPodLogs(clientset *kubernetes.Clientset, pod *corev1.Pod) (string, error) {
+	if pod == nil {
+		return "", fmt.Errorf("no job pod found, even though submission completed")
+	}
+	pods := clientset.CoreV1().Pods(pod.Namespace)
+
+	req := pods.GetLogs(pod.Name, &corev1.PodLogOptions{})
+	podLogs, err := req.Stream(context.TODO())
+	if err != nil {
+		return "", fmt.Errorf("failed to get logs for pod %s: %v", pod.Name, err)
+	}
+	defer podLogs.Close()
+
+	buf := new(bytes.Buffer)
+	_, err = io.Copy(buf, podLogs)
+	if err != nil {
+		return "", fmt.Errorf("error in copy information from pod logs to buf")
+	}
+	str := buf.String()
+
+	return str, nil
+}
+
+// getFlinkJobSubmitLog extract logs from the job submitter pod.
+func getFlinkJobSubmitLog(clientset *kubernetes.Clientset, observedPod *corev1.Pod) (*SubmitterLog, error) {
+	log, err := getPodLogs(clientset, observedPod)
+	if err != nil {
+		return nil, err
+	}
+
+	return getFlinkJobSubmitLogFromString(log), nil
+}
+
+func getFlinkJobSubmitLogFromString(podLog string) *SubmitterLog {
+	if result := jobIdRegexp.FindStringSubmatch(podLog); len(result) > 0 {
+		return &SubmitterLog{jobID: result[1], message: podLog}
+	} else {
+		return &SubmitterLog{jobID: "", message: podLog}
 	}
 }

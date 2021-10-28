@@ -25,7 +25,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
-	"github.com/googlecloudplatform/flink-operator/controllers/model"
+	"github.com/spotify/flink-on-k8s-operator/controllers/model"
 )
 
 func TestGetClusterResource(t *testing.T) {
@@ -70,26 +70,6 @@ func TestGetClusterResource(t *testing.T) {
 								Image: "flink:1.8.1",
 								Args:  []string{"jobmanager"},
 								Env: []v1.EnvVar{
-									{
-										Name: "JOB_MANAGER_CPU_LIMIT",
-										ValueFrom: &v1.EnvVarSource{
-											ResourceFieldRef: &v1.ResourceFieldSelector{
-												ContainerName: "jobmanager",
-												Resource:      "limits.cpu",
-												Divisor:       resource.MustParse("1m"),
-											},
-										},
-									},
-									{
-										Name: "JOB_MANAGER_MEMORY_LIMIT",
-										ValueFrom: &v1.EnvVarSource{
-											ResourceFieldRef: &v1.ResourceFieldSelector{
-												ContainerName: "jobmanager",
-												Resource:      "limits.memory",
-												Divisor:       resource.MustParse("1Mi"),
-											},
-										},
-									},
 									{Name: "HADOOP_CONF_DIR", Value: "/etc/hadoop/conf"},
 									{
 										Name:  "GOOGLE_APPLICATION_CREDENTIALS",
