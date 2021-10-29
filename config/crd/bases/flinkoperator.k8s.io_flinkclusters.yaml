@@ -64,11 +64,7 @@ spec:
                 envVars:
                   items:
                     properties:
-                      afterJobCancelled:
-                        type: string
-                      afterJobFails:
-                        type: string
-                      afterJobSucceeds:
+                      name:
                         type: string
                       value:
                         type: string
@@ -1698,13 +1694,8 @@ spec:
                                   properties:
                                     name:
                                       type: string
-                                    port:
-                                      anyOf:
-                                      - type: integer
-                                      - type: string
-                                      x-kubernetes-int-or-string: true
-                                  required:
-                                  - port
+                                    optional:
+                                      type: boolean
                                   type: object
                                 prefix:
                                   type: string
@@ -4222,7 +4213,7 @@ spec:
                                 type: integer
                               httpGet:
                                 properties:
-                                  key:
+                                  host:
                                     type: string
                                   httpHeaders:
                                     items:
@@ -4355,12 +4346,10 @@ spec:
                                   runAsUserName:
                                     type: string
                                 type: object
-                            required:
-                            - name
                             type: object
                           startupProbe:
                             properties:
-                              configMapRef:
+                              exec:
                                 properties:
                                   command:
                                     items:
@@ -4409,7 +4398,7 @@ spec:
                                 type: integer
                               tcpSocket:
                                 properties:
-                                  name:
+                                  host:
                                     type: string
                                   port:
                                     anyOf:
