@@ -763,21 +763,19 @@ func getDesiredJob(observed *ObservedClusterState) *batchv1.Job {
 // case 3) When latest created savepoint is unavailable, use the savepoint from which current job was restored.
 func convertFromSavepoint(jobSpec *v1beta1.JobSpec, jobStatus *v1beta1.JobStatus, revision *v1beta1.RevisionStatus) *string {
 	switch {
-	// Creating for the first time
-	case jobStatus == nil:
-		if !isBlank(jobSpec.FromSavepoint) {
-			return jobSpec.FromSavepoint
-		}
-		return nil
 	// Updating with FromSavepoint provided
 	case revision.IsUpdateTriggered() && !isBlank(jobSpec.FromSavepoint):
 		return jobSpec.FromSavepoint
 	// Latest savepoint
-	case jobStatus.SavepointLocation != "":
+	case jobStatus != nil && jobStatus.SavepointLocation != "":
 		return &jobStatus.SavepointLocation
 	// The savepoint from which current job was restored
-	case jobStatus.FromSavepoint != "":
+	case jobStatus != nil && jobStatus.FromSavepoint != "":
 		return &jobStatus.FromSavepoint
+	}
+	// Creating for the first time or other situation
+	if !isBlank(jobSpec.FromSavepoint) {
+		return jobSpec.FromSavepoint
 	}
 	return nil
 }
